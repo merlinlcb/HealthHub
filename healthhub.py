@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS entries (
   PRIMARY KEY (user_id, id)
 );
 CREATE INDEX IF NOT EXISTS entries_rev ON entries (user_id, rev);
+CREATE TABLE IF NOT EXISTS shared_foods (
+  id TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  added_by INTEGER,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -116,6 +124,10 @@ class Hub:
         with self.db() as conn:
             conn.executescript(SCHEMA)
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rev', '0')")
+            # Pick up custom foods that were made before sharing existed.
+            for u in conn.execute("SELECT id FROM users").fetchall():
+                self._absorb_foods(conn, u["id"])
+            self._spread_foods(conn)
 
     def db(self):
         conn = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
@@ -316,10 +328,9 @@ class Hub:
                     accepted += cur.rowcount
                 conn.execute("UPDATE meta SET value=? WHERE key='rev'", (str(rev),))
 
-            # Profile: newest copy wins.
-            profile_out = None
+            # Settings: newest copy wins.
             prof = body.get("profile")
-            server_prof_at = user["profile_updated"]
+            client_at = 0
             if isinstance(prof, dict) and isinstance(prof.get("data"), dict):
                 try:
                     client_at = int(prof.get("updatedAt") or 0)
@@ -328,13 +339,16 @@ class Hub:
                 blob = json.dumps(prof["data"], separators=(",", ":"))
                 if len(blob) > MAX_SETTINGS:
                     raise ApiError(400, "Settings too large.")
-                if client_at > server_prof_at:
+                if client_at > user["profile_updated"]:
                     conn.execute("UPDATE users SET profile=?, profile_updated=? WHERE id=?",
                                  (blob, client_at, uid))
-                elif client_at < server_prof_at:
-                    profile_out = {"data": json.loads(user["profile"]), "updatedAt": server_prof_at}
-            elif server_prof_at:
-                profile_out = {"data": json.loads(user["profile"]), "updatedAt": server_prof_at}
+            # Custom foods are shared: take in this phone's new ones, hand everyone the full list.
+            self._absorb_foods(conn, uid)
+            self._spread_foods(conn)
+            row = conn.execute("SELECT profile, profile_updated FROM users WHERE id=?", (uid,)).fetchone()
+            profile_out = None
+            if row["profile_updated"] and row["profile_updated"] > client_at:
+                profile_out = {"data": json.loads(row["profile"]), "updatedAt": row["profile_updated"]}
 
             stats = body.get("stats")
             if isinstance(stats, dict):
@@ -492,30 +506,14 @@ class Hub:
         finally:
             conn.close()
 
-    # ── custom foods (anyone can see and edit anyone's) ───────────────────
-    # The app keeps custom foods in the settings it syncs (users.profile). Editing
-    # them here marks the settings newer, so each phone pulls the change on its
-    # next sync, with no app change needed.
+    # ── custom foods: one list shared by everyone ─────────────────────────
+    # The app keeps custom foods in the settings it syncs (users.profile). The
+    # server keeps one shared list (shared_foods): any food a phone uploads that
+    # the list has never seen is added, and every person's settings are given
+    # the whole list, marked newer, so each phone pulls it on its next sync.
+    # The app cannot edit or delete custom foods, so the list is the authority:
+    # edits and deletions happen on the web page and apply to everyone.
     FOOD_NUMS = ("kcal", "protein", "carbs", "fat", "fiber")
-
-    @staticmethod
-    def _food_out(f):
-        return {"id": str(f.get("id")), "name": str(f.get("name") or ""),
-                "servingLabel": str(f.get("servingLabel") or "1 serving"),
-                **{k: round(_num(f.get(k)), 1) for k in Hub.FOOD_NUMS}}
-
-    def custom_foods(self, token):
-        conn = self.db()
-        try:
-            me = self.authenticate(conn, token)
-            people = []
-            for u in conn.execute("SELECT id, display_name, profile FROM users ORDER BY id"):
-                foods = self._settings(u).get("customFoods") or []
-                people.append({"id": u["id"], "displayName": u["display_name"], "isMe": u["id"] == me["id"],
-                               "foods": [self._food_out(f) for f in foods if isinstance(f, dict) and f.get("id")]})
-            return {"people": people}
-        finally:
-            conn.close()
 
     @staticmethod
     def _settings(row):
@@ -525,22 +523,70 @@ class Hub:
             s = {}
         return s if isinstance(s, dict) else {}
 
-    def _edit_foods(self, token, owner_id, fn):
+    @staticmethod
+    def _clean_food(f, fid=None):
+        def n(v):
+            x = round(max(0.0, min(_num(v), 20000.0)), 1)
+            return int(x) if x == int(x) else x
+        return {"id": str(fid or f.get("id"))[:80], "name": str(f.get("name") or "").strip()[:120],
+                "servingLabel": str(f.get("servingLabel") or "").strip()[:60] or "1 serving",
+                **{k: n(f.get(k)) for k in Hub.FOOD_NUMS}}
+
+    def _absorb_foods(self, conn, uid):
+        row = conn.execute("SELECT profile FROM users WHERE id=?", (uid,)).fetchone()
+        foods = self._settings(row).get("customFoods") if row else None
+        t = now_ms()
+        for f in foods if isinstance(foods, list) else []:
+            if not isinstance(f, dict) or not f.get("id") or not str(f.get("name") or "").strip():
+                continue
+            conn.execute("INSERT OR IGNORE INTO shared_foods (id, data, added_by, created, updated) VALUES (?,?,?,?,?)",
+                         (str(f["id"])[:80], json.dumps(self._clean_food(f), separators=(",", ":")), uid, t, t))
+
+    def _pool(self, conn):
+        rows = conn.execute("SELECT data FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall()
+        return [json.loads(r["data"]) for r in rows]
+
+    def _spread_foods(self, conn):
+        """Give every person the full shared list; returns how many settings changed."""
+        pool = self._pool(conn)
+        gone = {r["id"] for r in conn.execute("SELECT id FROM shared_foods WHERE deleted=1")}
+        changed = 0
+        for u in conn.execute("SELECT id, profile, profile_updated FROM users").fetchall():
+            settings = self._settings(u)
+            want = dict(settings)
+            want["customFoods"] = pool
+            if gone:
+                if isinstance(want.get("favorites"), list):
+                    want["favorites"] = [x for x in want["favorites"] if x not in gone]
+                if isinstance(want.get("recentFoods"), list):
+                    want["recentFoods"] = [r for r in want["recentFoods"]
+                                           if not (isinstance(r, dict) and r.get("foodId") in gone)]
+            if not pool and "customFoods" not in settings:
+                del want["customFoods"]  # nothing to share yet: leave untouched settings alone
+            if want == settings:
+                continue
+            conn.execute("UPDATE users SET profile=?, profile_updated=? WHERE id=?",
+                         (json.dumps(want, separators=(",", ":")), max(now_ms(), u["profile_updated"] + 1), u["id"]))
+            changed += 1
+        return changed
+
+    def custom_foods(self, token):
         conn = self.db()
         try:
             self.authenticate(conn, token)
+            names = {r["id"]: r["display_name"] for r in conn.execute("SELECT id, display_name FROM users")}
+            rows = conn.execute("SELECT data, added_by FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall()
+            return {"foods": [{**json.loads(r["data"]), "addedBy": names.get(r["added_by"], "")} for r in rows]}
+        finally:
+            conn.close()
+
+    def _edit_pool(self, token, fn):
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM users WHERE id=?", (owner_id,)).fetchone()
-            if not row:
-                raise ApiError(404, "No such person.")
-            settings = self._settings(row)
-            foods = [f for f in (settings.get("customFoods") or []) if isinstance(f, dict)]
-            result = fn(settings, foods)
-            blob = json.dumps(settings, separators=(",", ":"))
-            if len(blob) > MAX_SETTINGS:
-                raise ApiError(400, "Too many custom foods.")
-            conn.execute("UPDATE users SET profile=?, profile_updated=? WHERE id=?",
-                         (blob, max(now_ms(), row["profile_updated"] + 1), owner_id))
+            result = fn(conn, me)
+            self._spread_foods(conn)
             conn.execute("COMMIT")
             return result
         except BaseException:
@@ -551,53 +597,38 @@ class Hub:
             conn.close()
 
     def save_custom_food(self, token, body):
-        try:
-            owner_id = int(body.get("ownerId"))
-        except (TypeError, ValueError):
-            raise ApiError(400, "Pick whose food this is.")
         f = body.get("food") if isinstance(body.get("food"), dict) else {}
-        name = str(f.get("name") or "").strip()[:120]
-        if not name:
+        if not str(f.get("name") or "").strip():
             raise ApiError(400, "Give the food a name.")
-        clean = {"name": name, "servingLabel": (str(f.get("servingLabel") or "").strip()[:60] or "1 serving")}
         for k in self.FOOD_NUMS:
-            v = _num(f.get(k))
-            if v < 0 or v > 20000:
+            if not 0 <= _num(f.get(k)) <= 20000:
                 raise ApiError(400, "Numbers must be between 0 and 20,000.")
-            clean[k] = round(v, 1)
         fid = str(f.get("id") or "")
 
-        def apply(settings, foods):
+        def apply(conn, me):
+            t = now_ms()
             if fid:
-                for i, x in enumerate(foods):
-                    if str(x.get("id")) == fid:
-                        foods[i] = {**x, **clean}
-                        break
-                else:
+                if not conn.execute("SELECT 1 FROM shared_foods WHERE id=? AND deleted=0", (fid,)).fetchone():
                     raise ApiError(404, "That food no longer exists.")
-                out = foods[i]
+                food = self._clean_food(f, fid)
+                conn.execute("UPDATE shared_foods SET data=?, updated=? WHERE id=?",
+                             (json.dumps(food, separators=(",", ":")), t, fid))
             else:
-                out = {"id": "my-" + secrets.token_hex(6), **clean}
-                foods.append(out)
-            settings["customFoods"] = foods
-            return {"food": self._food_out(out)}
-        return self._edit_foods(token, owner_id, apply)
+                food = self._clean_food(f, "my-" + secrets.token_hex(6))
+                conn.execute("INSERT INTO shared_foods (id, data, added_by, created, updated) VALUES (?,?,?,?,?)",
+                             (food["id"], json.dumps(food, separators=(",", ":")), me["id"], t, t))
+            return {"food": food}
+        return self._edit_pool(token, apply)
 
     def delete_custom_food(self, token, body):
-        try:
-            owner_id = int(body.get("ownerId"))
-        except (TypeError, ValueError):
-            raise ApiError(400, "Pick whose food this is.")
         fid = str(body.get("id") or "")
 
-        def apply(settings, foods):
-            settings["customFoods"] = [f for f in foods if str(f.get("id")) != fid]
-            # Same clean-up the app does when you delete a custom food.
-            settings["favorites"] = [x for x in (settings.get("favorites") or []) if x != fid]
-            settings["recentFoods"] = [r for r in (settings.get("recentFoods") or [])
-                                       if not (isinstance(r, dict) and r.get("foodId") == fid)]
+        def apply(conn, me):
+            cur = conn.execute("UPDATE shared_foods SET deleted=1, updated=? WHERE id=? AND deleted=0", (now_ms(), fid))
+            if not cur.rowcount:
+                raise ApiError(404, "That food no longer exists.")
             return {"ok": True}
-        return self._edit_foods(token, owner_id, apply)
+        return self._edit_pool(token, apply)
 
     # ── dashboard ─────────────────────────────────────────────────────────
     def dashboard_users(self, token):
