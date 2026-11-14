@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Health Tracker — Trends</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10); --good:#006300; --bad:#d03b3b;
+    --weight:#2a78d6; --calories:#eb6834; --water:#1baf7a; --workout:#eda100; --fast:#e87ba4;
+    --accent:#2a78d6; --accent-ink:#fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10); --good:#0ca30c; --bad:#e66767;
+      --weight:#3987e5; --calories:#d95926; --water:#199e70; --workout:#c98500; --fast:#d55181;
+      --accent:#3987e5; --accent-ink:#fff;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--page); color:var(--ink);
+         font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  [hidden] { display:none !important; }
+  .wrap { max-width:1100px; margin:0 auto; padding:20px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 16px; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0; font-weight:650; }
+  .who { color:var(--ink2); flex:1; }
+  button, select, input { font:inherit; color:inherit; }
+  .link { background:none; border:0; color:var(--ink2); text-decoration:underline; cursor:pointer; padding:4px; }
+  .filters { display:flex; flex-wrap:wrap; gap:10px 20px; align-items:center; margin-bottom:16px; }
+  .seg { display:inline-flex; border:1px solid var(--ring); border-radius:8px; overflow:hidden; background:var(--surface); }
+  .seg button { border:0; background:none; padding:7px 14px; cursor:pointer; color:var(--ink2); }
+  .seg button + button { border-left:1px solid var(--ring); }
+  .seg button[aria-pressed="true"] { background:var(--accent); color:var(--accent-ink); font-weight:600; }
+  .seg button:focus-visible, .link:focus-visible, .btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .label { color:var(--muted); font-size:12px; margin-right:6px; }
+
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:16px; }
+  .tile { background:var(--surface); border:1px solid var(--ring); border-radius:12px; padding:14px 16px; }
+  .tile .k { color:var(--ink2); font-size:12px; }
+  .tile .v { font-size:26px; font-weight:650; line-height:1.2; margin-top:2px; }
+  .tile .v small { font-size:14px; font-weight:500; color:var(--ink2); }
+  .tile .d { font-size:12px; color:var(--ink2); margin-top:2px; }
+  .tile .d.good { color:var(--good); } .tile .d.bad { color:var(--bad); }
+
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr)); gap:12px; }
+  .card { background:var(--surface); border:1px solid var(--ring); border-radius:12px; padding:14px 16px 10px; min-width:0; }
+  .card.wide { grid-column:1 / -1; }
+  .card h2 { font-size:15px; margin:0; font-weight:650; display:flex; align-items:center; gap:8px; }
+  .card h2 i { width:10px; height:10px; border-radius:50%; display:inline-block; flex:none; }
+  .card .sub { color:var(--ink2); font-size:12px; margin:2px 0 6px; }
+  .plot { position:relative; }
+  .plot svg { display:block; max-width:100%; overflow:visible; touch-action:pan-y; }
+  .plot text { font-size:11px; fill:var(--muted); font-variant-numeric:tabular-nums; }
+  .plot .ref-label { fill:var(--ink2); paint-order:stroke; stroke:var(--surface); stroke-width:4px; stroke-linejoin:round; }
+  .tip { position:absolute; pointer-events:none; background:var(--surface); border:1px solid var(--ring);
+         border-radius:8px; padding:6px 10px; font-size:12px; box-shadow:0 4px 14px rgba(0,0,0,.18);
+         white-space:nowrap; transform:translate(-50%,-100%); z-index:2; }
+  .tip b { font-size:14px; display:block; }
+  .tip span { color:var(--ink2); }
+  .empty { color:var(--muted); padding:36px 0; text-align:center; }
+
+  .tablewrap { overflow-x:auto; max-height:420px; overflow-y:auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:6px 10px; border-bottom:1px solid var(--grid); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { position:sticky; top:0; background:var(--surface); color:var(--ink2); font-weight:600; font-size:12px; }
+  td.none { color:var(--muted); }
+
+  .login { max-width:340px; margin:12vh auto 0; background:var(--surface); border:1px solid var(--ring);
+           border-radius:14px; padding:24px; }
+  .login h1 { margin-bottom:4px; }
+  .login p { color:var(--ink2); margin:0 0 14px; }
+  .login label { display:block; font-size:12px; color:var(--ink2); margin:10px 0 4px; }
+  .login input { width:100%; padding:10px 12px; border:1px solid var(--axis); border-radius:8px; background:transparent; font-size:16px; }
+  .btn { width:100%; margin-top:16px; padding:11px; border:0; border-radius:8px; background:var(--accent);
+         color:var(--accent-ink); font-weight:600; cursor:pointer; font-size:15px; }
+  .err { color:var(--bad); margin-top:10px; min-height:1.4em; }
+  .foot { color:var(--muted); font-size:12px; margin-top:20px; text-align:center; }
+  .foot a { color:inherit; }
+</style>
+</head>
+<body>
+
+<form class="login" id="login" hidden>
+  <h1>Health Tracker</h1>
+  <p>Sign in with your app account to see trends.</p>
+  <label for="u">Username</label>
+  <input id="u" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+  <label for="p">Password</label>
+  <input id="p" type="password" autocomplete="current-password" required>
+  <button class="btn" type="submit">Sign in</button>
+  <div class="err" id="loginErr" role="alert"></div>
+  <div class="foot"><a href="/get">Get the Android app</a></div>
+</form>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <h1>Health Tracker</h1>
+    <span class="who" id="who"></span>
+    <button class="link" id="signout" type="button">Sign out</button>
+  </header>
+
+  <div class="filters">
+    <div id="peopleBox"><span class="label">Person</span><span class="seg" id="people"></span></div>
+    <div><span class="label">Range</span><span class="seg" id="ranges"></span></div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+  <div class="charts" id="charts"></div>
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const el = (tag, props = {}, kids = []) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'text') n.textContent = v; else if (k === 'class') n.className = v; else n.setAttribute(k, v);
+  }
+  for (const c of [].concat(kids)) if (c) n.append(c);
+  return n;
+};
+const SVG = 'http://www.w3.org/2000/svg';
+const svg = (tag, attrs = {}, text) => {
+  const n = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (text != null) n.textContent = text;
+  return n;
+};
+
+// ── days ──────────────────────────────────────────────────────────────────────
+const pad = n => String(n).padStart(2, '0');
+const dayNum = day => { const [y, m, d] = day.split('-').map(Number); return Math.round(Date.UTC(y, m - 1, d) / 864e5); };
+const numDay = n => { const d = new Date(n * 864e5); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; };
+const todayKey = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const fmtDay = (n, long) => new Date(n * 864e5).toLocaleDateString('en-US',
+  long ? { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }
+       : { month: 'short', day: 'numeric', timeZone: 'UTC' });
+const num = (v, digits = 0) => v.toLocaleString('en-US', { maximumFractionDigits: digits });
+
+// ── same goal maths as the app (app/src/lib/calc.js); the app stores metric ─────
+const LB_PER_KG = 2.20462, ML_PER_OZ = 29.5735;
+const FACTORS = { sedentary: 1.2, light: 1.375, moderate: 1.55, very: 1.725, extreme: 1.9 };
+// Daily water goal in fl oz (rest day).
+const waterGoal = p => {
+  const kg = p.weightKg || 70;
+  let ml = Math.min(Math.max(kg * 35, 1500), 4000);
+  if (p.climate === 'hot') ml += 500;
+  return Math.round(Math.round(ml / 50) * 50 / ML_PER_OZ);
+};
+const calorieTarget = p => {
+  if (!p.weightKg || !p.heightCm || !p.age) return null;
+  const base = 10 * p.weightKg + 6.25 * p.heightCm - 5 * p.age;
+  const tdee = Math.round(Math.round(p.sex === 'female' ? base - 161 : base + 5) * (FACTORS[p.activityLevel] || 1.55));
+  const delta = Math.round(((Number(p.paceKgPerWeek) || 0.5) * 7700) / 7);
+  let t = tdee;
+  if (p.goal === 'lose') t = tdee - delta;
+  if (p.goal === 'gain') t = tdee + Math.min(delta, 500);
+  return Math.round(Math.max(t, p.sex === 'female' ? 1200 : 1500));
+};
+
+// ── server ────────────────────────────────────────────────────────────────────
+const store = { get token() { try { return localStorage.getItem('ht_token') || ''; } catch (e) { return ''; } },
+                set token(v) { try { v ? localStorage.setItem('ht_token', v) : localStorage.removeItem('ht_token'); } catch (e) {} } };
+let memToken = store.token;
+async function call(path, body) {
+  const res = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    headers: Object.assign({}, body ? { 'Content-Type': 'application/json' } : {}, memToken ? { Authorization: 'Bearer ' + memToken } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let json = {};
+  try { json = await res.json(); } catch (e) {}
+  if (!res.ok) { const err = new Error(json.error || 'Server error (' + res.status + ')'); err.status = res.status; throw err; }
+  return json;
+}
+
+const view = { users: [], me: null, userId: null, range: '90', data: null };
+const RANGES = [['30', '30 days'], ['90', '90 days'], ['365', '1 year'], ['all', 'All time']];
+
+function showLogin(message) {
+  $('app').hidden = true; $('login').hidden = false; $('loginErr').textContent = message || ''; $('u').focus();
+}
+$('login').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('loginErr').textContent = '';
+  try {
+    const r = await call('/api/login', { username: $('u').value, password: $('p').value, device: 'dashboard' });
+    memToken = r.token; store.token = r.token; $('p').value = '';
+    start();
+  } catch (e) { $('loginErr').textContent = e.message; }
+});
+$('signout').addEventListener('click', async () => {
+  try { await call('/api/logout', {}); } catch (e) {}
+  memToken = ''; store.token = ''; showLogin();
+});
+
+async function start() {
+  if (!memToken) return showLogin();
+  try {
+    const r = await call('/api/dashboard/users');
+    view.users = r.users; view.me = r.me;
+    if (!view.users.some(u => u.id === view.userId)) view.userId = r.me.id;
+    $('login').hidden = true; $('app').hidden = false;
+    $('who').textContent = 'Signed in as ' + r.me.displayName;
+    $('peopleBox').hidden = view.users.length < 2;
+    buildSeg($('people'), view.users.map(u => [String(u.id), u.displayName]), String(view.userId), id => { view.userId = Number(id); load(); });
+    buildSeg($('ranges'), RANGES, view.range, r2 => { view.range = r2; render(); });
+    await load();
+  } catch (e) {
+    if (e.status === 401) { memToken = ''; store.token = ''; return showLogin(); }
+    showLogin(e.message);
+  }
+}
+
+function buildSeg(box, options, current, onPick) {
+  box.replaceChildren(...options.map(([value, label]) => {
+    const b = el('button', { type: 'button', 'aria-pressed': String(value === current), text: label });
+    b.addEventListener('click', () => {
+      box.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', 'false'));
+      b.setAttribute('aria-pressed', 'true');
+      onPick(value);
+    });
+    return b;
+  }));
+}
+
+async function load() {
+  try {
+    view.data = await call('/api/dashboard/data?user=' + view.userId);
+    render();
+  } catch (e) {
+    if (e.status === 401) { memToken = ''; store.token = ''; return showLogin('Sign in again.'); }
+    $('charts').replaceChildren(el('div', { class: 'card wide empty', text: e.message }));
+  }
+}
+
+// ── roll entries up by day ────────────────────────────────────────────────────
+function rollup(entries) {
+  const days = new Map();
+  const get = n => { if (!days.has(n)) days.set(n, { n, weight: null, wts: -1, calories: null, water: null, minutes: null, workouts: 0, fast: null }); return days.get(n); };
+  for (const e of entries) {
+    const d = get(dayNum(e.day)), x = e.data || {};
+    if (e.kind === 'day') {
+      // One whole day from the app: water (ml), food (kcal), exercise (minutes), plan workout.
+      const sum = (list, k) => (list || []).reduce((a, i) => a + (Number(i[k]) || 0), 0);
+      if ((x.water || []).length) d.water = Math.round(sum(x.water, 'ml') / ML_PER_OZ);
+      if ((x.food || []).length) d.calories = sum(x.food, 'kcal');
+      const mins = sum(x.exercise, 'minutes');
+      if (mins) d.minutes = mins;
+      d.workouts += (x.exercise || []).length || (x.workout && x.workout.done ? 1 : 0);
+    }
+    else if (e.kind === 'weight') {
+      const lb = x.kg != null ? Number(x.kg) * LB_PER_KG : Number(x.weight);
+      if (e.ts >= d.wts) { d.weight = Math.round(lb * 10) / 10 || null; d.wts = e.ts; }
+    }
+    else if (e.kind === 'fast' && x.start && x.end) d.fast = Math.max(d.fast || 0, Math.round((new Date(x.end) - new Date(x.start)) / 36e5 * 10) / 10);
+    else if (e.kind === 'calorie') d.calories = (d.calories || 0) + (Number(x.amount) || 0);
+    else if (e.kind === 'water') d.water = Number(x.oz) || 0;
+    else if (e.kind === 'workout') { d.minutes = (d.minutes || 0) + (Number(x.duration) || 0); d.workouts++; }
+    else if (e.kind === 'fast') d.fast = Math.max(d.fast || 0, Number(x.hours) || 0);
+  }
+  return days;
+}
+
+// Group daily values into buckets of `size` days. how: 'avg' | 'sum' | 'max'.
+function bucket(days, key, d0, d1, size, how) {
+  const out = [];
+  for (let start = d0; start <= d1; start += size) {
+    const vals = [];
+    for (let n = start; n < start + size && n <= d1; n++) { const d = days.get(n); if (d && d[key] != null) vals.push(d[key]); }
+    if (!vals.length) continue;
+    const v = how === 'sum' ? vals.reduce((a, b) => a + b, 0) : how === 'max' ? Math.max(...vals) : vals.reduce((a, b) => a + b, 0) / vals.length;
+    out.push({ n: start, span: Math.min(size, d1 - start + 1), v, count: vals.length });
+  }
+  return out;
+}
+
+// ── charts ────────────────────────────────────────────────────────────────────
+function niceTicks(lo, hi, want = 4) {
+  if (hi <= lo) hi = lo + 1;
+  const raw = (hi - lo) / want, mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * mag;
+  const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step, ticks = [];
+  for (let v = a; v <= b + step / 2; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+  return ticks;
+}
+
+// opts: { type:'line'|'bars', points:[{n,span,v}], d0, d1, color, unit, digits, ref:{value,label}, tipLabel(p) }
+function drawChart(opts) {
+  // Drawn at the card's real pixel width, so text is never scaled.
+  const W = Math.max(260, Math.round(opts.width || 560)), H = opts.wide ? 280 : 230, P = { l: 44, r: 14, t: 14, b: 26 };
+  const cw = W - P.l - P.r, ch = H - P.t - P.b;
+  const box = el('div', { class: 'plot' });
+  if (!opts.points.length) { box.append(el('div', { class: 'empty', text: 'Nothing logged in this range.' })); return box; }
+
+  const vals = opts.points.map(p => p.v).concat(opts.ref ? [opts.ref.value] : []);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  if (opts.type === 'bars') lo = 0;
+  else { const padY = (hi - lo) * 0.15 || Math.max(1, hi * 0.02); lo -= padY; hi += padY; }
+  const ticks = niceTicks(lo, hi);
+  lo = ticks[0]; hi = ticks[ticks.length - 1];
+  const span = opts.d1 - opts.d0 + 1;
+  const x = n => P.l + ((n - opts.d0) / span) * cw;          // left edge of a day
+  const xc = p => x(p.n) + (((p.span || 1) / span) * cw) / 2;  // centre of a point's band
+  const y = v => P.t + ch - ((v - lo) / (hi - lo)) * ch;
+
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img', 'aria-label': opts.aria });
+  for (const tk of ticks) {
+    s.append(svg('line', { x1: P.l, x2: W - P.r, y1: y(tk), y2: y(tk), stroke: tk === lo ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }));
+    s.append(svg('text', { x: P.l - 6, y: y(tk) + 4, 'text-anchor': 'end' }, num(tk, 1)));
+  }
+  const nLabels = Math.max(2, Math.min(span, Math.floor(cw / 90)));
+  for (let i = 0; i < nLabels; i++) {
+    const n = opts.d0 + Math.round((i + 0.5) * (span / nLabels) - 0.5);
+    s.append(svg('text', { x: x(n) + cw / span / 2, y: H - 6, 'text-anchor': 'middle' }, fmtDay(n)));
+  }
+  if (opts.ref) {
+    s.append(svg('line', { x1: P.l, x2: W - P.r, y1: y(opts.ref.value), y2: y(opts.ref.value), stroke: 'var(--ink2)', 'stroke-width': 1, 'stroke-dasharray': '2 3' }));
+    // On a column chart the label would sit on top of the columns, so the card's subtitle names the line instead.
+    if (opts.type === 'line') s.append(svg('text', { class: 'ref-label', x: W - P.r, y: y(opts.ref.value) - 5, 'text-anchor': 'end' }, opts.ref.label));
+  }
+
+  if (opts.type === 'bars') {
+    for (const p of opts.points) {
+      const band = ((p.span || 1) / span) * cw, w = Math.max(1, Math.min(24, band - 2));
+      const top = y(p.v), h = Math.max(0, y(lo) - top), r = Math.min(4, w / 2, h);
+      const x0 = xc(p) - w / 2;
+      // rounded data-end, square at the baseline
+      s.append(svg('path', { fill: opts.color, d: `M${x0},${top + h} V${top + r} Q${x0},${top} ${x0 + r},${top} H${x0 + w - r} Q${x0 + w},${top} ${x0 + w},${top + r} V${top + h} Z` }));
+    }
+  } else {
+    s.append(svg('polyline', { fill: 'none', stroke: opts.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      points: opts.points.map(p => `${xc(p).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ') }));
+    if (opts.points.length <= 40) {
+      for (const p of opts.points) s.append(svg('circle', { cx: xc(p), cy: y(p.v), r: 4, fill: opts.color, stroke: 'var(--surface)', 'stroke-width': 2 }));
+    }
+    const last = opts.points[opts.points.length - 1];
+    s.append(svg('circle', { cx: xc(last), cy: y(last.v), r: 4.5, fill: opts.color, stroke: 'var(--surface)', 'stroke-width': 2 }));
+  }
+
+  // hover layer: crosshair + tooltip on the nearest point
+  const cross = svg('line', { y1: P.t, y2: P.t + ch, stroke: 'var(--axis)', 'stroke-width': 1, visibility: 'hidden' });
+  const dot = svg('circle', { r: 5, fill: opts.color, stroke: 'var(--surface)', 'stroke-width': 2, visibility: 'hidden' });
+  const hit = svg('rect', { x: P.l, y: 0, width: cw, height: H, fill: 'transparent' });
+  s.append(cross, dot, hit);
+  const tip = el('div', { class: 'tip', hidden: '' });
+  const move = ev => {
+    const r = s.getBoundingClientRect(), px = ((ev.clientX - r.left) / r.width) * W;
+    let best = opts.points[0];
+    for (const p of opts.points) if (Math.abs(xc(p) - px) < Math.abs(xc(best) - px)) best = p;
+    const cx = xc(best), cy = y(best.v);
+    cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.setAttribute('visibility', 'visible');
+    dot.setAttribute('cx', cx); dot.setAttribute('cy', cy); dot.setAttribute('visibility', 'visible');
+    tip.replaceChildren(el('b', { text: `${num(best.v, opts.digits || 0)} ${opts.unit}` }), el('span', { text: opts.tipLabel(best) }));
+    tip.hidden = false;
+    const leftPx = (cx / W) * r.width;
+    tip.style.left = Math.max(70, Math.min(r.width - 70, leftPx)) + 'px';
+    tip.style.top = Math.max(44, (cy / H) * r.height - 10) + 'px';
+  };
+  const leave = () => { tip.hidden = true; cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); };
+  hit.addEventListener('pointermove', move);
+  hit.addEventListener('pointerdown', move);
+  hit.addEventListener('pointerleave', leave);
+  box.append(s, tip);
+  return box;
+}
+
+// A chart is drawn only once its card is on the page and has a width.
+const pending = [];
+function chart(opts) {
+  const slot = el('div', { class: 'plot' });
+  pending.push([slot, opts]);
+  return slot;
+}
+function drawPending() {
+  for (const [slot, opts] of pending.splice(0)) {
+    slot.replaceWith(drawChart(Object.assign({ width: slot.clientWidth, wide: !!slot.closest('.wide') }, opts)));
+  }
+}
+
+function card(title, sub, colorVar, body, wide) {
+  return el('section', { class: 'card' + (wide ? ' wide' : '') }, [
+    el('h2', {}, [colorVar ? el('i', { style: `background:var(${colorVar})` }) : null, document.createTextNode(title)]),
+    el('div', { class: 'sub', text: sub }),
+    body,
+  ]);
+}
+
+function tile(k, v, unit, d, tone) {
+  const value = el('div', { class: 'v', text: v });
+  if (unit) value.append(' ', el('small', { text: unit }));
+  return el('div', { class: 'tile' }, [el('div', { class: 'k', text: k }), value, d ? el('div', { class: 'd' + (tone ? ' ' + tone : ''), text: d }) : null]);
+}
+
+function render() {
+  const data = view.data;
+  if (!data) return;
+  const settings = data.profile || {}, stats = data.stats || {};
+  const profile = settings.profile || {};
+  const days = rollup(data.entries);
+  const today = dayNum(todayKey());
+  const all = [...days.keys()];
+  const first = all.length ? Math.min(...all) : today;
+  const d1 = today;
+  const d0 = view.range === 'all' ? Math.min(first, today - 13) : today - Number(view.range) + 1;
+  const span = d1 - d0 + 1;
+  const size = span > 120 ? 7 : 1; // weekly columns once daily ones would get too thin
+  const per = size === 7 ? 'weekly average' : 'per day';
+  const tipDay = p => (p.span > 1 ? `Week of ${fmtDay(p.n, true)} · ${p.count} day${p.count === 1 ? '' : 's'} logged` : fmtDay(p.n, true));
+  const inRange = [...days.values()].filter(d => d.n >= d0 && d.n <= d1).sort((a, b) => a.n - b.n);
+  const name = data.user.displayName;
+
+  const weights = inRange.filter(d => d.weight != null).map(d => ({ n: d.n, span: 1, v: d.weight }));
+  const allWeights = [...days.values()].filter(d => d.weight != null).sort((a, b) => a.n - b.n);
+  const latest = allWeights.length ? allWeights[allWeights.length - 1].weight : null;
+  const target = profile.goalWeightKg && profile.goal === 'lose' ? Math.round(profile.goalWeightKg * LB_PER_KG * 10) / 10 : 0;
+  const calTarget = calorieTarget(profile);
+  const wGoal = profile.weightKg ? waterGoal(profile) : null;
+
+  // ── tiles ──
+  const tiles = [];
+  if (latest != null) {
+    let d = null, tone = '';
+    if (weights.length >= 2) {
+      const diff = Math.round((weights[weights.length - 1].v - weights[0].v) * 10) / 10;
+      const losing = !target || target < latest || diff <= 0;
+      d = diff === 0 ? 'No change in this range' : `${diff < 0 ? '▼' : '▲'} ${num(Math.abs(diff), 1)} lb in this range`;
+      tone = diff === 0 ? '' : (diff < 0) === losing ? 'good' : 'bad';
+    }
+    tiles.push(tile('Weight', num(latest, 1), 'lb', d, tone));
+    if (target) {
+      const left = Math.round((latest - target) * 10) / 10;
+      tiles.push(tile('To target', left <= 0 ? 'Reached' : num(left, 1), left <= 0 ? '' : 'lb', `Target ${num(target, 1)} lb`));
+    }
+  } else tiles.push(tile('Weight', '—', '', 'No weigh-ins yet'));
+  const calDays = inRange.filter(d => d.calories != null);
+  if (calDays.length) {
+    const avg = calDays.reduce((a, d) => a + d.calories, 0) / calDays.length;
+    tiles.push(tile('Average calories', num(avg), 'cal/day', calTarget ? `Target ${num(calTarget)} · ${calDays.length} days logged` : `${calDays.length} days logged`));
+  }
+  const waterDays = inRange.filter(d => d.water != null && d.water > 0);
+  if (waterDays.length && wGoal) {
+    const hit = waterDays.filter(d => d.water >= wGoal).length;
+    tiles.push(tile('Water goal met', `${hit} of ${waterDays.length}`, 'days', `Goal ${wGoal} fl oz a day`));
+  }
+  const wo = inRange.reduce((a, d) => ({ c: a.c + d.workouts, m: a.m + (d.minutes || 0) }), { c: 0, m: 0 });
+  tiles.push(tile('Workouts', num(wo.c), '', wo.c ? `${num(wo.m)} minutes in this range` : 'None in this range'));
+  if (stats.level) {
+    tiles.push(tile('Level', String(stats.level), stats.title || '', `${num(stats.xp || 0)} XP · ${stats.streak || 0}-day streak`));
+  }
+  $('tiles').replaceChildren(...tiles);
+
+  // ── charts ──
+  const cards = [];
+  cards.push(card('Weight', 'Pounds, one point per weigh-in day', '--weight', chart({
+    type: 'line', points: weights, d0, d1, color: 'var(--weight)', unit: 'lb', digits: 1,
+    ref: target && weights.length ? { value: target, label: `Target ${num(target, 1)} lb` } : null,
+    tipLabel: tipDay, aria: `${name}'s weight over time`,
+  }), true));
+  cards.push(card('Calories', `Calories eaten, ${per}` + (calTarget ? ` · dotted line: target ${num(calTarget)}` : ''), '--calories', chart({
+    type: 'bars', points: bucket(days, 'calories', d0, d1, size, 'avg'), d0, d1, color: 'var(--calories)', unit: 'cal',
+    ref: calTarget ? { value: calTarget, label: `Target ${num(calTarget)}` } : null,
+    tipLabel: tipDay, aria: `${name}'s calories ${per}`,
+  })));
+  cards.push(card('Water', `Fluid ounces, ${per}` + (wGoal ? ` · dotted line: goal ${wGoal}` : ''), '--water', chart({
+    type: 'bars', points: bucket(days, 'water', d0, d1, size, 'avg'), d0, d1, color: 'var(--water)', unit: 'fl oz',
+    ref: wGoal ? { value: wGoal, label: `Goal ${wGoal} fl oz` } : null,
+    tipLabel: tipDay, aria: `${name}'s water ${per}`,
+  })));
+  // Weeks start on Monday so the columns match the app's weekly race.
+  const dow = (new Date(d0 * 864e5).getUTCDay() + 6) % 7;
+  cards.push(card('Workouts', 'Minutes per week', '--workout', chart({
+    type: 'bars', points: bucket(days, 'minutes', d0 - dow, d1, 7, 'sum'), d0: d0 - dow, d1, color: 'var(--workout)', unit: 'min',
+    tipLabel: p => `Week of ${fmtDay(p.n, true)}`, aria: `${name}'s workout minutes per week`,
+  })));
+  cards.push(card('Fasting', size === 7 ? 'Longest fast each week, hours' : 'Longest fast finished each day, hours', '--fast', chart({
+    type: 'bars', points: bucket(days, 'fast', d0, d1, size, 'max'), d0, d1, color: 'var(--fast)', unit: 'h',
+    tipLabel: p => (p.span > 1 ? `Week of ${fmtDay(p.n, true)}` : fmtDay(p.n, true)), aria: `${name}'s fasting hours`,
+  })));
+
+  // ── table view ──
+  const cell = (v, digits) => el('td', v == null ? { class: 'none', text: '—' } : { text: num(v, digits) });
+  const rows = [...inRange].reverse().map(d => el('tr', {}, [
+    el('td', { text: fmtDay(d.n, true) }), cell(d.weight, 1), cell(d.calories == null ? null : Math.round(d.calories)),
+    cell(d.water, 1), cell(d.minutes), cell(d.fast, 1),
+  ]));
+  const table = rows.length
+    ? el('div', { class: 'tablewrap' }, el('table', {}, [
+        el('thead', {}, el('tr', {}, ['Day', 'Weight (lb)', 'Calories', 'Water (fl oz)', 'Workout (min)', 'Fast (h)'].map(h => el('th', { scope: 'col', text: h })))),
+        el('tbody', {}, rows)]))
+    : el('div', { class: 'empty', text: 'Nothing logged in this range.' });
+  cards.push(card('Daily log', `Every day ${name} logged something, newest first`, null, table, true));
+  $('charts').replaceChildren(...cards);
+  drawPending();
+
+  const seen = data.statsUpdated ? new Date(data.statsUpdated).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'never';
+  $('foot').textContent = `${name}'s phone last synced ${seen} · ${num(data.entries.length)} entries in total`;
+}
+
+let resizeTimer = null, lastWidth = window.innerWidth;
+window.addEventListener('resize', () => {
+  if (window.innerWidth === lastWidth) return; // phones fire resize when the address bar hides
+  lastWidth = window.innerWidth;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(render, 150);
+});
+
+start();
+</script>
+</body>
+</html>
