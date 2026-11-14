@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS users (
   is_admin INTEGER NOT NULL DEFAULT 0,
   profile TEXT NOT NULL DEFAULT '{}',
   profile_updated INTEGER NOT NULL DEFAULT 0,
+  profile_client_at INTEGER NOT NULL DEFAULT 0,
   stats TEXT NOT NULL DEFAULT '{}',
   stats_updated INTEGER NOT NULL DEFAULT 0,
   created INTEGER NOT NULL
@@ -124,6 +125,12 @@ class Hub:
         with self.db() as conn:
             conn.executescript(SCHEMA)
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rev', '0')")
+            if "profile_client_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
+                # When the person's phone last sent settings (as opposed to the server updating them).
+                conn.execute("ALTER TABLE users ADD COLUMN profile_client_at INTEGER NOT NULL DEFAULT 0")
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(shared_foods)")}
+            if "merged_into" not in cols:
+                conn.execute("ALTER TABLE shared_foods ADD COLUMN merged_into TEXT")
             # Pick up custom foods that were made before sharing existed.
             for u in conn.execute("SELECT id FROM users").fetchall():
                 self._absorb_foods(conn, u["id"])
@@ -339,9 +346,13 @@ class Hub:
                 blob = json.dumps(prof["data"], separators=(",", ":"))
                 if len(blob) > MAX_SETTINGS:
                     raise ApiError(400, "Settings too large.")
-                if client_at > user["profile_updated"]:
-                    conn.execute("UPDATE users SET profile=?, profile_updated=? WHERE id=?",
-                                 (blob, client_at, uid))
+                # Newest copy from any of this person's phones wins. Updates the server made itself
+                # (handing out shared foods) don't count, so they can't make a phone's own change look old.
+                if client_at > user["profile_client_at"]:
+                    conn.execute("UPDATE users SET profile=?, profile_client_at=?, profile_updated=MAX(profile_updated, ?)"
+                                 " WHERE id=?", (blob, client_at, client_at, uid))
+                # Foods this phone created are kept even if its copy of the settings lost.
+                self._absorb_foods(conn, uid, prof["data"].get("customFoods"))
             # Custom foods are shared: take in this phone's new ones, hand everyone the full list.
             self._absorb_foods(conn, uid)
             self._spread_foods(conn)
@@ -532,9 +543,10 @@ class Hub:
                 "servingLabel": str(f.get("servingLabel") or "").strip()[:60] or "1 serving",
                 **{k: n(f.get(k)) for k in Hub.FOOD_NUMS}}
 
-    def _absorb_foods(self, conn, uid):
-        row = conn.execute("SELECT profile FROM users WHERE id=?", (uid,)).fetchone()
-        foods = self._settings(row).get("customFoods") if row else None
+    def _absorb_foods(self, conn, uid, foods=None):
+        if foods is None:
+            row = conn.execute("SELECT profile FROM users WHERE id=?", (uid,)).fetchone()
+            foods = self._settings(row).get("customFoods") if row else None
         t = now_ms()
         for f in foods if isinstance(foods, list) else []:
             if not isinstance(f, dict) or not f.get("id") or not str(f.get("name") or "").strip():
@@ -542,25 +554,61 @@ class Hub:
             conn.execute("INSERT OR IGNORE INTO shared_foods (id, data, added_by, created, updated) VALUES (?,?,?,?,?)",
                          (str(f["id"])[:80], json.dumps(self._clean_food(f), separators=(",", ":")), uid, t, t))
 
+    @staticmethod
+    def _food_key(f):
+        norm = lambda v: re.sub(r"\s+", " ", str(v or "")).strip().lower()
+        return (norm(f.get("name")), norm(f.get("servingLabel")), round(_num(f.get("kcal"))), round(_num(f.get("protein"))))
+
+    def _dedupe_foods(self, conn):
+        """Identical foods (same name, serving, calories, protein) become one: the oldest is kept."""
+        keep = {}
+        for r in conn.execute("SELECT id, data FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall():
+            k = self._food_key(json.loads(r["data"]))
+            if k in keep:
+                conn.execute("UPDATE shared_foods SET deleted=1, merged_into=?, updated=? WHERE id=?",
+                             (keep[k], now_ms(), r["id"]))
+            else:
+                keep[k] = r["id"]
+
     def _pool(self, conn):
         rows = conn.execute("SELECT data FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall()
         return [json.loads(r["data"]) for r in rows]
 
     def _spread_foods(self, conn):
         """Give every person the full shared list; returns how many settings changed."""
+        self._dedupe_foods(conn)
         pool = self._pool(conn)
-        gone = {r["id"] for r in conn.execute("SELECT id FROM shared_foods WHERE deleted=1")}
+        gone, moved = set(), {}
+        for r in conn.execute("SELECT id, merged_into FROM shared_foods WHERE deleted=1"):
+            if r["merged_into"]:
+                moved[r["id"]] = r["merged_into"]
+            else:
+                gone.add(r["id"])
         changed = 0
         for u in conn.execute("SELECT id, profile, profile_updated FROM users").fetchall():
             settings = self._settings(u)
             want = dict(settings)
             want["customFoods"] = pool
-            if gone:
+            if gone or moved:
+                # Deleted foods drop out of favourites and recents; merged ones point at the kept copy.
                 if isinstance(want.get("favorites"), list):
-                    want["favorites"] = [x for x in want["favorites"] if x not in gone]
+                    favs = []
+                    for x in want["favorites"]:
+                        x = moved.get(x, x)
+                        if x not in gone and x not in favs:
+                            favs.append(x)
+                    want["favorites"] = favs
                 if isinstance(want.get("recentFoods"), list):
-                    want["recentFoods"] = [r for r in want["recentFoods"]
-                                           if not (isinstance(r, dict) and r.get("foodId") in gone)]
+                    recent, seen = [], set()
+                    for r in want["recentFoods"]:
+                        if isinstance(r, dict) and r.get("foodId") in moved:
+                            r = {**r, "foodId": moved[r["foodId"]]}
+                        fid = r.get("foodId") if isinstance(r, dict) else None
+                        if fid in gone or (fid is not None and fid in seen):
+                            continue
+                        seen.add(fid)
+                        recent.append(r)
+                    want["recentFoods"] = recent
             if not pool and "customFoods" not in settings:
                 del want["customFoods"]  # nothing to share yet: leave untouched settings alone
             if want == settings:

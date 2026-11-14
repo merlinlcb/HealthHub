@@ -323,6 +323,49 @@ class HubTest(unittest.TestCase):
         self.assertEqual(got["recentFoods"], [])
         self.assertEqual([f["name"] for f in self.call("GET", "/api/customfoods", token=tok)["foods"]], ["Toast", "Pancakes"])
 
+    def test_identical_foods_are_merged(self):
+        tok, _ = self.signup("merlin")
+        tok_b, _ = self.signup("bro")
+        jerky = {"name": "Lil landjager", "servingLabel": "1 serving", "kcal": 120, "protein": 7, "carbs": 1, "fat": 10}
+        self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [{**jerky, "id": "my-b1"}],
+                  "favorites": ["my-b1"]}, "updatedAt": 100}}, tok_b)
+        # The same food made separately on the other phone (different id, different spacing/case).
+        self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [
+            {**jerky, "id": "my-m1", "name": "lil  Landjager "}, {**jerky, "id": "my-m2", "name": "Other", "kcal": 5}],
+            "favorites": ["my-m1", "db-banana"], "recentFoods": [{"foodId": "my-m1", "qty": 2}]}, "updatedAt": 200}}, tok)
+        # Two identical web adds, too.
+        for _ in range(2):
+            self.call("POST", "/api/customfoods/save", {"food": {"name": "Winco Chicken Breast", "servingLabel": "56 g",
+                                                                  "kcal": 50, "protein": 11}}, tok_b)
+        names = [f["name"] for f in self.call("GET", "/api/customfoods", token=tok)["foods"]]
+        self.assertEqual(names, ["Lil landjager", "Other", "Winco Chicken Breast"])
+        got = self.call("POST", "/api/sync", {}, tok)["profile"]["data"]
+        self.assertEqual([f["id"] for f in got["customFoods"]][0], "my-b1")
+        self.assertEqual(got["favorites"], ["my-b1", "db-banana"])          # pointed at the kept copy
+        self.assertEqual(got["recentFoods"], [{"foodId": "my-b1", "qty": 2}])
+        # Different nutrition is a different food.
+        self.call("POST", "/api/customfoods/save", {"food": {**jerky, "kcal": 130}}, tok)
+        self.assertEqual(len(self.call("GET", "/api/customfoods", token=tok)["foods"]), 4)
+
+    def test_a_phone_change_made_before_foods_were_handed_out_is_kept(self):
+        tok, _ = self.signup("merlin")
+        tok_b, _ = self.signup("bro")
+        self.call("POST", "/api/sync", {"profile": {"data": {"profile": {"name": "Merlin"}, "customFoods": []},
+                                                    "updatedAt": 100}}, tok)
+        # Bro adds a food: the server hands it to Merlin, marking Merlin's settings newer (now).
+        self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [
+            {"id": "my-b1", "name": "Oats", "kcal": 300}]}, "updatedAt": 100}}, tok_b)
+        # Merlin's phone, offline meanwhile, changed his name and made a food at time 200 (before "now").
+        r = self.call("POST", "/api/sync", {"profile": {"data": {"profile": {"name": "Merlin L"}, "customFoods": [
+            {"id": "my-m1", "name": "Toast", "kcal": 90}]}, "updatedAt": 200}}, tok)
+        got = r["profile"]["data"]
+        self.assertEqual(got["profile"], {"name": "Merlin L"})
+        self.assertEqual(sorted(f["name"] for f in got["customFoods"]), ["Oats", "Toast"])
+        self.assertGreater(r["profile"]["updatedAt"], 200)
+        # A stale copy from another phone (older than the last one the server took) still loses.
+        r = self.call("POST", "/api/sync", {"profile": {"data": {"profile": {"name": "old"}}, "updatedAt": 150}}, tok)
+        self.assertEqual(r["profile"]["data"]["profile"], {"name": "Merlin L"})
+
     def test_foods_made_before_sharing_are_picked_up_at_start(self):
         tok, _ = self.signup("merlin")
         self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [
