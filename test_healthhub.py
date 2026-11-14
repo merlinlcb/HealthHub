@@ -326,6 +326,14 @@ class HubTest(unittest.TestCase):
         self.assertEqual(got["recentFoods"], [])
         self.assertEqual([f["name"] for f in self.call("GET", "/api/customfoods", token=tok)["foods"]], ["Toast", "Pancakes"])
 
+    def test_shared_foods_keep_label_micronutrients(self):
+        tok, _ = self.signup("merlin")
+        tok_b, _ = self.signup("bro")
+        food = {"id": "my-1", "name": "Bar", "kcal": 200, "protein": 20, "micro": {"sodium": 160, "satFat": 3.5, "bad key!": 1, "x": "nan?"}}
+        self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [food]}, "updatedAt": 5}}, tok_b)
+        got = self.call("POST", "/api/sync", {}, tok)["profile"]["data"]["customFoods"][0]
+        self.assertEqual(got["micro"], {"sodium": 160, "satFat": 3.5, "x": 0})
+
     def test_identical_foods_are_merged(self):
         tok, _ = self.signup("merlin")
         tok_b, _ = self.signup("bro")

@@ -646,9 +646,16 @@ class Hub:
         def n(v):
             x = round(max(0.0, min(_num(v), 20000.0)), 1)
             return int(x) if x == int(x) else x
-        return {"id": str(fid or f.get("id"))[:80], "name": str(f.get("name") or "").strip()[:120],
-                "servingLabel": str(f.get("servingLabel") or "").strip()[:60] or "1 serving",
-                **{k: n(f.get(k)) for k in Hub.FOOD_NUMS}}
+        out = {"id": str(fid or f.get("id"))[:80], "name": str(f.get("name") or "").strip()[:120],
+               "servingLabel": str(f.get("servingLabel") or "").strip()[:60] or "1 serving",
+               **{k: n(f.get(k)) for k in Hub.FOOD_NUMS}}
+        # Optional micronutrients per serving (e.g. read off a label): short names → numbers.
+        micro = f.get("micro")
+        if isinstance(micro, dict):
+            clean = {str(k)[:20]: n(v) for k, v in list(micro.items())[:40] if re.match(r"^[A-Za-z0-9]{1,20}$", str(k))}
+            if clean:
+                out["micro"] = clean
+        return out
 
     def _absorb_foods(self, conn, uid, foods=None):
         if foods is None:
