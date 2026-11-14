@@ -10,6 +10,7 @@ Configuration (environment):
   HT_BIND         listen address                      (default 0.0.0.0)
   HT_PORT         listen port                         (default 8787)
   HT_INVITE_CODE  code needed to create an account    (required)
+  HT_UPLOAD_TOKEN secret that lets a build (GitHub Actions) upload new APKs (optional)
 """
 import datetime
 import hashlib
@@ -31,6 +32,8 @@ KINDS = {"day", "calorie", "weight", "fast", "workout", "water"}
 MAX_ENTRY = 64 * 1024
 MAX_SETTINGS = 512 * 1024
 MAX_BODY = 8 * 1024 * 1024
+MAX_APK = 200 * 1024 * 1024
+LINK_TTL = 15 * 60
 MAX_PUSH = 20000
 MAX_MSG = 2000
 ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,80}$")
@@ -114,7 +117,9 @@ def token_hash(token):
 class Hub:
     """All server behaviour, independent of HTTP so it is easy to test."""
 
-    def __init__(self, data_dir, invite_code):
+    def __init__(self, data_dir, invite_code, upload_token=""):
+        self.upload_token = upload_token or ""
+        self._links = {}  # one-off download links: token -> expiry time
         if not invite_code:
             raise ValueError("an invite code is required")
         os.makedirs(data_dir, exist_ok=True)
@@ -448,14 +453,98 @@ class Hub:
             pass
         return apk, info
 
-    def apk_for_code(self, code):
-        """Path to the APK if the invite code is right."""
+    def apk_for_code(self, code, username="", password=""):
+        """Path to the APK for the invite code, or for an account's username and password."""
         if self._throttled("apk"):
             raise ApiError(429, "Too many attempts. Try again in a few minutes.")
-        if not hmac.compare_digest(str(code or "").strip().encode(), self.invite_code.encode()):
+        ok = False
+        if str(username or "").strip():
+            conn = self.db()
+            try:
+                row = conn.execute("SELECT * FROM users WHERE username=?", (str(username).strip().lower(),)).fetchone()
+            finally:
+                conn.close()
+            candidate = hash_password(str(password or ""), row["pw_salt"] if row else b"0" * 16)
+            ok = bool(row) and hmac.compare_digest(candidate, row["pw_hash"])
+            message = "Wrong username or password."
+        else:
+            ok = hmac.compare_digest(str(code or "").strip().encode(), self.invite_code.encode())
+            message = "That invite code is not right."
+        if not ok:
             self._note_failure("apk")
-            raise ApiError(403, "That invite code is not right.")
+            raise ApiError(403, message)
+        return self._apk_or_404()
+
+    def _apk_or_404(self):
         apk, info = self.apk_info()
+        if not info["available"]:
+            raise ApiError(404, "No app build has been uploaded yet.")
+        return apk, info
+
+    def apk_link(self, token):
+        """A short-lived download link for a signed-in app (a browser can't send our sign-in header)."""
+        conn = self.db()
+        try:
+            self.authenticate(conn, token)
+        finally:
+            conn.close()
+        _, info = self._apk_or_404()
+        t = time.time()
+        with self._fail_lock:
+            self._links = {k: v for k, v in self._links.items() if v > t}
+            link = secrets.token_urlsafe(24)
+            self._links[link] = t + LINK_TTL
+        return {"url": "/dl/" + link, "versionCode": info["versionCode"], "versionName": info["versionName"]}
+
+    def apk_for_link(self, link):
+        with self._fail_lock:
+            expiry = self._links.get(link)
+        if not expiry or expiry < time.time():
+            raise ApiError(404, "This download link has expired. Open the update from the app again.")
+        return self._apk_or_404()
+
+    def store_apk(self, auth_header, stream, length, version_code, version_name):
+        """Called by the build (GitHub Actions): replace the APK the app offers as an update."""
+        given = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+        if not self.upload_token or not hmac.compare_digest(given.encode(), self.upload_token.encode()):
+            raise ApiError(403, "Not allowed.")
+        try:
+            code = int(version_code)
+        except (TypeError, ValueError):
+            raise ApiError(400, "versionCode must be a number.")
+        if code <= 0 or not re.match(r"^[0-9A-Za-z.\-]{1,20}$", str(version_name or "")):
+            raise ApiError(400, "Bad version.")
+        if not 1000 < length <= MAX_APK:
+            raise ApiError(400, "That is not an APK.")
+        folder = os.path.join(os.path.dirname(self.db_path), "apk")
+        os.makedirs(folder, exist_ok=True)
+        tmp = os.path.join(folder, "upload.tmp")
+        left = length
+        with open(tmp, "wb") as fh:
+            first = True
+            while left:
+                chunk = stream.read(min(left, 1024 * 1024))
+                if not chunk:
+                    break
+                if first and not chunk.startswith(b"PK"):
+                    fh.close()
+                    os.remove(tmp)
+                    raise ApiError(400, "That is not an APK.")
+                first = False
+                fh.write(chunk)
+                left -= len(chunk)
+        if left:
+            os.remove(tmp)
+            raise ApiError(400, "Upload was cut short.")
+        _, current = self.apk_info()
+        if current["available"] and code < current["versionCode"]:
+            os.remove(tmp)
+            raise ApiError(409, "The server already has a newer version (%d)." % current["versionCode"])
+        os.replace(tmp, os.path.join(folder, "HealthTracker.apk"))
+        with open(os.path.join(folder, "version.json.tmp"), "w", encoding="utf-8") as fh:
+            json.dump({"versionCode": code, "versionName": str(version_name)}, fh)
+        os.replace(os.path.join(folder, "version.json.tmp"), os.path.join(folder, "version.json"))
+        return {"ok": True, "versionCode": code, "versionName": str(version_name)}
         if not info["available"]:
             raise ApiError(404, "No app build has been uploaded yet.")
         return apk, info
@@ -906,6 +995,9 @@ def make_handler(hub):
             if method == "GET":
                 if path in ("/", "/index.html"):
                     return self._static("dashboard.html")
+                if path.startswith("/dl/"):
+                    apk, info = hub.apk_for_link(path[4:])
+                    return self._send_apk(apk, info)
                 if path == "/get":
                     return self._static("get.html")
                 if path == "/healthz":
@@ -935,8 +1027,25 @@ def make_handler(hub):
                 if path == "/download":
                     # A plain HTML form post, so the code never appears in a URL or a log.
                     form = parse_qs(self._raw_body().decode("utf-8", "replace"))
-                    apk, info = hub.apk_for_code(form.get("code", [""])[0])
+                    field = lambda k: form.get(k, [""])[0]
+                    try:
+                        apk, info = hub.apk_for_code(field("code"), field("username"), field("password"))
+                    except ApiError as e:  # a browser form: answer with a page, not JSON
+                        page = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,'
+                                'initial-scale=1"><title>Health Tracker</title><body style="font:16px system-ui;padding:24px">'
+                                '<p>%s</p><p><a href="/get">Try again</a></p>' % e.message.replace("<", "&lt;"))
+                        return self._send(e.status, page.encode(), "text/html; charset=utf-8")
                     return self._send_apk(apk, info)
+                if path == "/api/app/upload":
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        length = 0
+                    return self._send(200, hub.store_apk(self.headers.get("Authorization") or "", self.rfile, length,
+                                                         q.get("versionCode", [""])[0], q.get("versionName", [""])[0]))
+                if path == "/api/app/link":
+                    self._raw_body()
+                    return self._send(200, hub.apk_link(tok))
                 body = self._body()
                 if path == "/api/register":
                     return self._send(200, hub.register(body))
@@ -979,8 +1088,8 @@ def make_handler(hub):
     return Handler
 
 
-def make_server(data_dir, invite_code, bind="127.0.0.1", port=0):
-    hub = Hub(data_dir, invite_code)
+def make_server(data_dir, invite_code, bind="127.0.0.1", port=0, upload_token=""):
+    hub = Hub(data_dir, invite_code, upload_token)
     httpd = ThreadingHTTPServer((bind, port), make_handler(hub))
     httpd.daemon_threads = True
     httpd.hub = hub
@@ -992,7 +1101,8 @@ def main():
     if not invite:
         sys.exit("HT_INVITE_CODE must be set (the code people need to create an account).")
     httpd = make_server(os.environ.get("HT_DATA", "./data"), invite,
-                        os.environ.get("HT_BIND", "0.0.0.0"), int(os.environ.get("HT_PORT", "8787")))
+                        os.environ.get("HT_BIND", "0.0.0.0"), int(os.environ.get("HT_PORT", "8787")),
+                        os.environ.get("HT_UPLOAD_TOKEN", ""))
     print("HealthHub %s listening on %s:%s" % (VERSION, *httpd.server_address), flush=True)
     try:
         httpd.serve_forever()

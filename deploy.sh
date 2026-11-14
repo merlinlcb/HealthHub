@@ -23,6 +23,11 @@ tar -cf - healthhub.py healthhub.service static | ssh "$HOST" '
     ( umask 077; echo "HT_INVITE_CODE=$code" > /etc/healthhub.env )
     echo "Invite code (share with your brother): $code"
   fi
+  if ! grep -q "^HT_UPLOAD_TOKEN=" /etc/healthhub.env; then
+    up=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+    echo "HT_UPLOAD_TOKEN=$up" >> /etc/healthhub.env
+    echo "Upload token for GitHub (secret HEALTHHUB_UPLOAD_TOKEN): $up"
+  fi
   mv /opt/healthhub/healthhub.service /etc/systemd/system/healthhub.service
   systemctl daemon-reload
   systemctl enable -q healthhub
