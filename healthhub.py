@@ -10,7 +10,10 @@ Configuration (environment):
   HT_BIND         listen address                      (default 0.0.0.0)
   HT_PORT         listen port                         (default 8787)
   HT_INVITE_CODE  code needed to create an account    (required)
-  HT_UPLOAD_TOKEN secret that lets a build (GitHub Actions) upload new APKs (optional)
+  HT_UPLOAD_TOKEN secret that lets a build upload new APKs to /api/app/upload (optional)
+  HT_GITHUB_TOKEN read-only GitHub token; the server then checks the repo's latest release
+                  every 15 minutes and offers any newer APK as an update (optional)
+  HT_GITHUB_REPO  owner/repo to check                (default merlinlcb/HealthTracker)
 """
 import datetime
 import hashlib
@@ -25,6 +28,8 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.error
+import urllib.request
 from urllib.parse import parse_qs, urlparse
 
 VERSION = "2.0.0"
@@ -508,6 +513,9 @@ class Hub:
         given = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
         if not self.upload_token or not hmac.compare_digest(given.encode(), self.upload_token.encode()):
             raise ApiError(403, "Not allowed.")
+        return self._install_apk(stream, length, version_code, version_name)
+
+    def _install_apk(self, stream, length, version_code, version_name):
         try:
             code = int(version_code)
         except (TypeError, ValueError):
@@ -800,6 +808,53 @@ class Hub:
             }
         finally:
             conn.close()
+
+
+# ── pulling new builds from GitHub releases ────────────────────────────────────
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # handled by hand so the GitHub token is not sent on to the download host
+
+
+def check_github_release(hub, repo, token, opener=None, api="https://api.github.com"):
+    """Offer the newest GitHub release's HealthTracker.apk if it is newer than what we have.
+    Release tags look like v2.0.<build>; <build> is the Android versionCode."""
+    opener = opener or urllib.request.build_opener(_NoRedirect)
+    head = {"Authorization": "Bearer " + token, "User-Agent": "HealthHub", "X-GitHub-Api-Version": "2022-11-28"}
+    req = urllib.request.Request("%s/repos/%s/releases/latest" % (api, repo), headers={**head, "Accept": "application/vnd.github+json"})
+    with opener.open(req, timeout=30) as r:
+        rel = json.load(r)
+    m = re.match(r"^v?((?:\d+\.)*?(\d+))$", str(rel.get("tag_name") or ""))
+    if not m:
+        return "latest release tag %r is not a version" % rel.get("tag_name")
+    name, code = m.group(1), int(m.group(2))
+    _, current = hub.apk_info()
+    if current["available"] and code <= current["versionCode"]:
+        return "up to date (%s)" % current["versionName"]
+    asset = next((a for a in rel.get("assets") or [] if a.get("name") == "HealthTracker.apk"), None)
+    if not asset:
+        return "release %s has no HealthTracker.apk" % name
+    req = urllib.request.Request(asset["url"], headers={**head, "Accept": "application/octet-stream"})
+    try:
+        resp = opener.open(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            raise
+        resp = urllib.request.urlopen(urllib.request.Request(e.headers["Location"], headers={"User-Agent": "HealthHub"}), timeout=300)
+    with resp:
+        length = int(resp.headers.get("Content-Length") or asset.get("size") or 0)
+        hub._install_apk(resp, length, code, name)
+    return "now offering %s" % name
+
+
+def github_release_loop(hub, repo, token, every=900):
+    time.sleep(20)
+    while True:
+        try:
+            print("healthhub: github release check:", check_github_release(hub, repo, token), flush=True)
+        except Exception as e:  # keep going; GitHub or the network may be down for a while
+            print("healthhub: github release check failed:", repr(e), file=sys.stderr, flush=True)
+        time.sleep(every)
 
 
 # ── HTTP layer ────────────────────────────────────────────────────────────────
@@ -1104,6 +1159,10 @@ def main():
                         os.environ.get("HT_BIND", "0.0.0.0"), int(os.environ.get("HT_PORT", "8787")),
                         os.environ.get("HT_UPLOAD_TOKEN", ""))
     print("HealthHub %s listening on %s:%s" % (VERSION, *httpd.server_address), flush=True)
+    if os.environ.get("HT_GITHUB_TOKEN"):
+        threading.Thread(target=github_release_loop, daemon=True,
+                         args=(httpd.hub, os.environ.get("HT_GITHUB_REPO") or "merlinlcb/HealthTracker",
+                               os.environ["HT_GITHUB_TOKEN"])).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

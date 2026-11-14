@@ -420,6 +420,49 @@ class HubTest(unittest.TestCase):
         hub.upload_token = ""
         self.assertEqual(upload(apk, 15)[0], 403)
 
+    def test_pulls_new_builds_from_github_releases(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        apk = b"PK\x03\x04" + os.urandom(200000)
+        state = {"tag": "v2.0.14", "seen_auth_on_download": None}
+
+        class FakeGitHub(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                base = "http://127.0.0.1:%d" % self.server.server_address[1]
+                if self.path == "/repos/me/app/releases/latest":
+                    assert self.headers["Authorization"] == "Bearer gh-token"
+                    body = json.dumps({"tag_name": state["tag"], "assets": [
+                        {"name": "HealthTracker.apk", "url": base + "/asset/1", "size": len(apk)}]}).encode()
+                    self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/asset/1":
+                    self.send_response(302); self.send_header("Location", base + "/s3/file"); self.end_headers()
+                elif self.path == "/s3/file":
+                    state["seen_auth_on_download"] = self.headers.get("Authorization")
+                    self.send_response(200); self.send_header("Content-Length", str(len(apk))); self.end_headers()
+                    self.wfile.write(apk)
+
+        gh = HTTPServer(("127.0.0.1", 0), FakeGitHub)
+        threading.Thread(target=gh.serve_forever, daemon=True).start()
+        api = "http://127.0.0.1:%d" % gh.server_address[1]
+        hub = self.httpd.hub
+        try:
+            msg = healthhub.check_github_release(hub, "me/app", "gh-token", api=api)
+            self.assertEqual(msg, "now offering 2.0.14")
+            self.assertIsNone(state["seen_auth_on_download"])  # the token never leaves GitHub's API
+            self.assertEqual(self.call("GET", "/api/app"), {"available": True, "versionCode": 14, "versionName": "2.0.14"})
+            path, _ = hub.apk_info()
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), apk)
+            self.assertEqual(healthhub.check_github_release(hub, "me/app", "gh-token", api=api), "up to date (2.0.14)")
+            state["tag"] = "nightly"
+            self.assertIn("not a version", healthhub.check_github_release(hub, "me/app", "gh-token", api=api))
+        finally:
+            gh.shutdown()
+            gh.server_close()
+
     def test_bad_requests(self):
         self.call("GET", "/nope", expect=404)
         self.call("GET", "/healthz")
