@@ -746,6 +746,8 @@ def _num(v):
 
 
 def calorie_target(p):
+    if _num(p.get("calorieGoal")) > 0:  # the person's own target
+        return _jsround(_num(p["calorieGoal"]))
     kg, cm, age = _num(p.get("weightKg")), _num(p.get("heightCm")), _num(p.get("age"))
     if not (kg and cm and age):
         return 2000

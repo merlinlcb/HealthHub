@@ -224,6 +224,8 @@ class HubTest(unittest.TestCase):
         got = [[healthhub.calorie_target(p), healthhub.protein_goal(p), healthhub.water_goal_ml(p, 0),
                 healthhub.water_goal_ml(p, 45)] for p in ps]
         self.assertEqual(got, [[2283, 153, 3850, 4400], [2209, 83, 2950, 3500], [3431, 170, 2800, 3350]])
+        self.assertEqual(healthhub.calorie_target({**ps[0], "calorieGoal": 2650}), 2650)
+        self.assertEqual(healthhub.calorie_target({**ps[0], "calorieGoal": None}), 2283)
 
     def test_compare_shares_only_weights_and_goal_hits(self):
         tok, _ = self.signup("merlin")
