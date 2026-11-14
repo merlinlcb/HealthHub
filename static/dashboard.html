@@ -211,6 +211,7 @@ const waterGoal = p => {
   return Math.round(Math.round(ml / 50) * 50 / ML_PER_OZ);
 };
 const calorieTarget = p => {
+  if (Number(p.calorieGoal) > 0) return Math.round(Number(p.calorieGoal)); // their own target
   if (!p.weightKg || !p.heightCm || !p.age) return null;
   const base = 10 * p.weightKg + 6.25 * p.heightCm - 5 * p.age;
   const tdee = Math.round(Math.round(p.sex === 'female' ? base - 161 : base + 5) * (FACTORS[p.activityLevel] || 1.55));
