@@ -90,6 +90,16 @@ CREATE TABLE IF NOT EXISTS shared_foods (
   updated INTEGER NOT NULL,
   deleted INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_by INTEGER,
+  updated_by INTEGER,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -775,6 +785,58 @@ class Hub:
             return {"ok": True}
         return self._edit_pool(token, apply)
 
+    # ── shared notes (everyone can read and edit) ─────────────────────────
+    def notes(self, token):
+        conn = self.db()
+        try:
+            self.authenticate(conn, token)
+            rows = conn.execute(
+                "SELECT n.*, a.display_name AS by_name, b.display_name AS edit_name FROM notes n"
+                " LEFT JOIN users a ON a.id = n.created_by LEFT JOIN users b ON b.id = n.updated_by"
+                " WHERE n.deleted=0 ORDER BY n.updated DESC").fetchall()
+            return {"notes": [{"id": r["id"], "title": r["title"], "body": r["body"], "createdBy": r["by_name"] or "",
+                               "updatedBy": r["edit_name"] or "", "created": r["created"], "updated": r["updated"]}
+                              for r in rows]}
+        finally:
+            conn.close()
+
+    def save_note(self, token, body):
+        title = str(body.get("title") or "").strip()[:120]
+        text = str(body.get("body") or "")[:20000]
+        if not title and not text.strip():
+            raise ApiError(400, "The note is empty.")
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
+            t = now_ms()
+            nid = body.get("id")
+            if nid:
+                cur = conn.execute("UPDATE notes SET title=?, body=?, updated_by=?, updated=? WHERE id=? AND deleted=0",
+                                   (title or "Untitled", text, me["id"], t, int(nid)))
+                if not cur.rowcount:
+                    raise ApiError(404, "That note was deleted.")
+            else:
+                nid = conn.execute("INSERT INTO notes (title, body, created_by, updated_by, created, updated) VALUES (?,?,?,?,?,?)",
+                                   (title or "Untitled", text, me["id"], me["id"], t, t)).lastrowid
+            return {"id": int(nid), "updated": t}
+        except (TypeError, ValueError):
+            raise ApiError(400, "Bad note id.")
+        finally:
+            conn.close()
+
+    def delete_note(self, token, body):
+        conn = self.db()
+        try:
+            self.authenticate(conn, token)
+            cur = conn.execute("UPDATE notes SET deleted=1, updated=? WHERE id=? AND deleted=0", (now_ms(), int(body.get("id") or 0)))
+            if not cur.rowcount:
+                raise ApiError(404, "That note was already deleted.")
+            return {"ok": True}
+        except (TypeError, ValueError):
+            raise ApiError(400, "Bad note id.")
+        finally:
+            conn.close()
+
     # ── dashboard ─────────────────────────────────────────────────────────
     def dashboard_users(self, token):
         conn = self.db()
@@ -941,6 +1003,7 @@ def water_goal_ml(p, exercise_min=0):
 
 
 def goal_hits(profile, day, weighed, fast_hours, fasting_on):
+    """None means that goal is switched off for this person."""
     day = day or {}
     water = sum(_num(w.get("ml")) for w in day.get("water") or [])
     food = day.get("food") or []
@@ -958,6 +1021,8 @@ def goal_hits(profile, day, weighed, fast_hours, fasting_on):
     }
     if not fasting_on:
         hits["fast"] = None
+    if profile.get("waterTracking") is False:
+        hits["water"] = None
     return hits
 
 
@@ -1071,6 +1136,8 @@ def make_handler(hub):
                     return self._send(200, hub.chat_list(tok, qint("since")))
                 if path == "/api/customfoods":
                     return self._send(200, hub.custom_foods(tok))
+                if path == "/api/notes":
+                    return self._send(200, hub.notes(tok))
                 if path == "/api/compare":
                     today = q.get("today", [""])[0]
                     return self._send(200, hub.compare(tok, qint("days", 7), today if DAY_RE.match(today) else None))
@@ -1114,6 +1181,10 @@ def make_handler(hub):
                     return self._send(200, hub.sync(tok, body))
                 if path == "/api/chat":
                     return self._send(200, hub.chat_post(tok, body))
+                if path == "/api/notes/save":
+                    return self._send(200, hub.save_note(tok, body))
+                if path == "/api/notes/delete":
+                    return self._send(200, hub.delete_note(tok, body))
                 if path == "/api/customfoods/save":
                     return self._send(200, hub.save_custom_food(tok, body))
                 if path == "/api/customfoods/delete":

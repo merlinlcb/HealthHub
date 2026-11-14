@@ -463,6 +463,21 @@ class HubTest(unittest.TestCase):
             gh.shutdown()
             gh.server_close()
 
+    def test_shared_notes(self):
+        tok, _ = self.signup("merlin")
+        tok_b, _ = self.signup("bro")
+        self.call("GET", "/api/notes", expect=401)
+        self.call("POST", "/api/notes/save", {"title": " ", "body": " "}, tok, expect=400)
+        n = self.call("POST", "/api/notes/save", {"title": "Gym plan", "body": "Mon: chest"}, tok)["id"]
+        self.call("POST", "/api/notes/save", {"id": n, "title": "Gym plan", "body": "Mon: chest\nTue: legs"}, tok_b)
+        notes = self.call("GET", "/api/notes", token=tok)["notes"]
+        self.assertEqual([(x["title"], x["body"], x["createdBy"], x["updatedBy"]) for x in notes],
+                         [("Gym plan", "Mon: chest\nTue: legs", "Merlin", "Bro")])
+        self.call("POST", "/api/notes/delete", {"id": n}, tok_b)
+        self.assertEqual(self.call("GET", "/api/notes", token=tok)["notes"], [])
+        self.call("POST", "/api/notes/save", {"id": n, "title": "x"}, tok, expect=404)
+        self.call("POST", "/api/notes/delete", {"id": "abc"}, tok, expect=400)
+
     def test_bad_requests(self):
         self.call("GET", "/nope", expect=404)
         self.call("GET", "/healthz")
