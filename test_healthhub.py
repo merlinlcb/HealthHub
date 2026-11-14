@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -374,6 +375,50 @@ class HubTest(unittest.TestCase):
             {"id": "my-1", "name": "Old food", "kcal": 10}]}, "updatedAt": 5}}, tok)
         hub = healthhub.Hub(self.tmp.name, "letmein")  # a restart
         self.assertEqual([f["name"] for f in hub.custom_foods(tok)["foods"]], ["Old food"])
+
+    def test_update_flow_without_invite_code(self):
+        tok, _ = self.signup("merlin")
+        apk = b"PK\x03\x04" + os.urandom(300000)
+        # Nothing uploaded yet.
+        self.call("POST", "/api/app/link", {}, tok, expect=404)
+        # The build uploads with the upload token; anything else is refused.
+        hub = self.httpd.hub
+        hub.upload_token = "up-secret"
+        def upload(data, code, name="2.0.%s", token="up-secret"):
+            req = urllib.request.Request(self.base + "/api/app/upload?versionCode=%s&versionName=%s" % (code, name % code),
+                                         data=data, method="POST", headers={"Authorization": "Bearer " + token})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+        self.assertEqual(upload(apk, 14, token="wrong")[0], 403)
+        self.assertEqual(upload(b"not an apk" * 200, 14)[0], 400)
+        self.assertEqual(upload(apk, "x")[0], 400)
+        self.assertEqual(upload(apk, 14), (200, {"ok": True, "versionCode": 14, "versionName": "2.0.14"}))
+        self.assertEqual(upload(apk, 12)[0], 409)  # never go backwards by accident
+        self.assertEqual(self.call("GET", "/api/app"), {"available": True, "versionCode": 14, "versionName": "2.0.14"})
+        # The signed-in app gets a one-off link; it works without any header, for a while.
+        self.call("POST", "/api/app/link", {}, expect=401)
+        link = self.call("POST", "/api/app/link", {}, tok)
+        self.assertEqual((link["versionCode"], link["versionName"]), (14, "2.0.14"))
+        self.assertTrue(link["url"].startswith("/dl/"))
+        with urllib.request.urlopen(self.base + link["url"]) as r:
+            self.assertEqual(r.read(), apk)
+            self.assertIn("HealthTracker-2.0.14.apk", r.headers["Content-Disposition"])
+        self.call("GET", "/dl/made-up", expect=404)
+        hub._links[link["url"][4:]] = time.time() - 1
+        self.call("GET", link["url"], expect=404)
+        # The /get page also takes an account instead of the invite code.
+        status, _, body = self.post_form("/download", {"username": "Merlin", "password": "password1"})
+        self.assertEqual((status, body), (200, apk))
+        status, _, body = self.post_form("/download", {"username": "merlin", "password": "nope"})
+        self.assertEqual(status, 403)
+        self.assertIn(b"Wrong username or password", body)
+        self.assertIn(b"<a href=\"/get\">", body)
+        # Without an upload token configured, uploads are off.
+        hub.upload_token = ""
+        self.assertEqual(upload(apk, 15)[0], 403)
 
     def test_bad_requests(self):
         self.call("GET", "/nope", expect=404)

@@ -20,23 +20,30 @@
   button { width:100%; margin-top:12px; padding:13px; font-size:16px; font-weight:600; border:0; border-radius:8px;
            background:var(--accent); color:#fff; }
   ol { color:var(--dim); font-size:14px; padding-left:20px; margin:20px 0 0; }
+  .or { text-align:center; color:var(--dim); font-size:13px; margin:12px 0 4px; }
   #ver { font-size:13px; color:var(--dim); margin-top:14px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Health Tracker</h1>
-  <p>Enter the invite code to download the Android app.</p>
+  <p>Sign in with your Health Tracker account to download the Android app. New here? Use the invite code instead.</p>
   <form method="post" action="/download">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
+    <label for="password" style="margin-top:10px">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password">
+    <div class="or">or</div>
     <label for="code">Invite code</label>
-    <input id="code" name="code" autocomplete="off" autocapitalize="none" spellcheck="false" required autofocus>
+    <input id="code" name="code" autocomplete="off" autocapitalize="none" spellcheck="false">
     <button type="submit">Download the app</button>
   </form>
   <div id="ver"></div>
   <ol>
     <li>Open the downloaded file. Android will ask you to allow installs from your browser — allow it.</li>
     <li>If you already have Health Tracker, install over it. Your data is kept.</li>
-    <li>Open the app, go to Settings → Account, and create your account with the same invite code.</li>
+    <li>New? Open the app, go to Settings → Account &amp; sync, and create your account with the invite code.</li>
+    <li>From now on the app offers updates itself; you won't need this page again.</li>
   </ol>
 </main>
 <script>
