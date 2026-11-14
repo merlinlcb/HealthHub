@@ -492,6 +492,113 @@ class Hub:
         finally:
             conn.close()
 
+    # ── custom foods (anyone can see and edit anyone's) ───────────────────
+    # The app keeps custom foods in the settings it syncs (users.profile). Editing
+    # them here marks the settings newer, so each phone pulls the change on its
+    # next sync, with no app change needed.
+    FOOD_NUMS = ("kcal", "protein", "carbs", "fat", "fiber")
+
+    @staticmethod
+    def _food_out(f):
+        return {"id": str(f.get("id")), "name": str(f.get("name") or ""),
+                "servingLabel": str(f.get("servingLabel") or "1 serving"),
+                **{k: round(_num(f.get(k)), 1) for k in Hub.FOOD_NUMS}}
+
+    def custom_foods(self, token):
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
+            people = []
+            for u in conn.execute("SELECT id, display_name, profile FROM users ORDER BY id"):
+                foods = self._settings(u).get("customFoods") or []
+                people.append({"id": u["id"], "displayName": u["display_name"], "isMe": u["id"] == me["id"],
+                               "foods": [self._food_out(f) for f in foods if isinstance(f, dict) and f.get("id")]})
+            return {"people": people}
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _settings(row):
+        try:
+            s = json.loads(row["profile"] or "{}")
+        except ValueError:
+            s = {}
+        return s if isinstance(s, dict) else {}
+
+    def _edit_foods(self, token, owner_id, fn):
+        conn = self.db()
+        try:
+            self.authenticate(conn, token)
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM users WHERE id=?", (owner_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "No such person.")
+            settings = self._settings(row)
+            foods = [f for f in (settings.get("customFoods") or []) if isinstance(f, dict)]
+            result = fn(settings, foods)
+            blob = json.dumps(settings, separators=(",", ":"))
+            if len(blob) > MAX_SETTINGS:
+                raise ApiError(400, "Too many custom foods.")
+            conn.execute("UPDATE users SET profile=?, profile_updated=? WHERE id=?",
+                         (blob, max(now_ms(), row["profile_updated"] + 1), owner_id))
+            conn.execute("COMMIT")
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def save_custom_food(self, token, body):
+        try:
+            owner_id = int(body.get("ownerId"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Pick whose food this is.")
+        f = body.get("food") if isinstance(body.get("food"), dict) else {}
+        name = str(f.get("name") or "").strip()[:120]
+        if not name:
+            raise ApiError(400, "Give the food a name.")
+        clean = {"name": name, "servingLabel": (str(f.get("servingLabel") or "").strip()[:60] or "1 serving")}
+        for k in self.FOOD_NUMS:
+            v = _num(f.get(k))
+            if v < 0 or v > 20000:
+                raise ApiError(400, "Numbers must be between 0 and 20,000.")
+            clean[k] = round(v, 1)
+        fid = str(f.get("id") or "")
+
+        def apply(settings, foods):
+            if fid:
+                for i, x in enumerate(foods):
+                    if str(x.get("id")) == fid:
+                        foods[i] = {**x, **clean}
+                        break
+                else:
+                    raise ApiError(404, "That food no longer exists.")
+                out = foods[i]
+            else:
+                out = {"id": "my-" + secrets.token_hex(6), **clean}
+                foods.append(out)
+            settings["customFoods"] = foods
+            return {"food": self._food_out(out)}
+        return self._edit_foods(token, owner_id, apply)
+
+    def delete_custom_food(self, token, body):
+        try:
+            owner_id = int(body.get("ownerId"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Pick whose food this is.")
+        fid = str(body.get("id") or "")
+
+        def apply(settings, foods):
+            settings["customFoods"] = [f for f in foods if str(f.get("id")) != fid]
+            # Same clean-up the app does when you delete a custom food.
+            settings["favorites"] = [x for x in (settings.get("favorites") or []) if x != fid]
+            settings["recentFoods"] = [r for r in (settings.get("recentFoods") or [])
+                                       if not (isinstance(r, dict) and r.get("foodId") == fid)]
+            return {"ok": True}
+        return self._edit_foods(token, owner_id, apply)
+
     # ── dashboard ─────────────────────────────────────────────────────────
     def dashboard_users(self, token):
         conn = self.db()
@@ -734,6 +841,8 @@ def make_handler(hub):
                     return self._send(200, hub.friends(tok))
                 if path == "/api/chat":
                     return self._send(200, hub.chat_list(tok, qint("since")))
+                if path == "/api/customfoods":
+                    return self._send(200, hub.custom_foods(tok))
                 if path == "/api/compare":
                     today = q.get("today", [""])[0]
                     return self._send(200, hub.compare(tok, qint("days", 7), today if DAY_RE.match(today) else None))
@@ -760,6 +869,10 @@ def make_handler(hub):
                     return self._send(200, hub.sync(tok, body))
                 if path == "/api/chat":
                     return self._send(200, hub.chat_post(tok, body))
+                if path == "/api/customfoods/save":
+                    return self._send(200, hub.save_custom_food(tok, body))
+                if path == "/api/customfoods/delete":
+                    return self._send(200, hub.delete_custom_food(tok, body))
             raise ApiError(404, "Not found.")
 
         def _handle(self, method):
