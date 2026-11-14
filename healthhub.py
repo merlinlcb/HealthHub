@@ -11,7 +11,9 @@ Configuration (environment):
   HT_PORT         listen port                         (default 8787)
   HT_INVITE_CODE  code needed to create an account    (required)
 """
+import datetime
 import hashlib
+import math
 import hmac
 import json
 import os
@@ -433,6 +435,63 @@ class Hub:
             raise ApiError(404, "No app build has been uploaded yet.")
         return apk, info
 
+    # ── compare (everyone can see this) ───────────────────────────────────
+    def compare(self, token, days, today=None):
+        """Per person: weights and whether each daily goal was hit. Only yes/no per
+        goal is shared, never the underlying calories, water or food."""
+        days = max(1, min(int(days or 7), 90))
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
+            end = datetime.date.fromisoformat(today) if today else datetime.date.today()
+            keys = [(end - datetime.timedelta(days=i)).isoformat() for i in range(days)]
+            start = keys[-1]
+            people = []
+            for u in conn.execute("SELECT * FROM users ORDER BY id"):
+                settings = json.loads(u["profile"] or "{}")
+                profile = settings.get("profile") or {}
+                fasting_on = (settings.get("fasting") or {}).get("enabled", True) is not False
+                rows = conn.execute(
+                    "SELECT kind, day, ts, data FROM entries WHERE user_id=? AND deleted=0 AND kind IN ('day','weight','fast')",
+                    (u["id"],)).fetchall()
+                by_day = {}
+                weights = []
+                fasts = {}
+                for r in rows:
+                    d = json.loads(r["data"])
+                    if r["kind"] == "day":
+                        by_day[r["day"]] = d
+                    elif r["kind"] == "weight" and d.get("kg"):
+                        weights.append((r["day"], r["ts"], float(d["kg"])))
+                    elif r["kind"] == "fast" and d.get("start") and d.get("end"):
+                        h = (_iso_ms(d["end"]) - _iso_ms(d["start"])) / 3600000
+                        fasts[r["day"]] = max(fasts.get(r["day"], 0), h)
+                weights.sort()
+                weighed = {w[0] for w in weights}
+                goal_rows = []
+                for k in keys:
+                    goal_rows.append({"day": k, "hits": goal_hits(profile, by_day.get(k), k in weighed,
+                                                                  fasts.get(k, 0), fasting_on)})
+                before = [w for w in weights if w[0] < start]
+                in_range = [w for w in weights if start <= w[0] <= keys[0]]
+                base = (before[-1] if before else (in_range[0] if in_range else None))
+                current = weights[-1] if weights else None
+                people.append({
+                    "id": u["id"], "displayName": u["display_name"], "isMe": u["id"] == me["id"],
+                    "currentKg": current[2] if current else None,
+                    "currentDay": current[0] if current else None,
+                    "startKg": base[2] if base else None,
+                    "goalKg": profile.get("goalWeightKg") if profile.get("goal") == "lose" else None,
+                    "units": profile.get("units") or "imperial",
+                    "fasting": fasting_on,
+                    "level": (json.loads(u["stats"] or "{}")).get("level"),
+                    "streak": (json.loads(u["stats"] or "{}")).get("streak"),
+                    "days": goal_rows,
+                })
+            return {"days": keys, "goals": GOALS, "people": people}
+        finally:
+            conn.close()
+
     # ── dashboard ─────────────────────────────────────────────────────────
     def dashboard_users(self, token):
         conn = self.db()
@@ -471,6 +530,103 @@ class Hub:
 # ── HTTP layer ────────────────────────────────────────────────────────────────
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                 ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+
+
+# ── goal maths, the same as the app (app/src/lib/calc.js and game.js) ────────
+GOALS = [
+    {"id": "water", "icon": "💧", "label": "Water"},
+    {"id": "food", "icon": "🍽️", "label": "Calories on target"},
+    {"id": "protein", "icon": "🥩", "label": "Protein"},
+    {"id": "move", "icon": "🏋️", "label": "Workout"},
+    {"id": "weigh", "icon": "⚖️", "label": "Weigh-in"},
+    {"id": "fast", "icon": "⏱️", "label": "12h fast"},
+]
+_FACTORS = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "very": 1.725, "extreme": 1.9}
+
+
+def _jsround(x):
+    return math.floor(x + 0.5)
+
+
+def _iso_ms(s):
+    return datetime.datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp() * 1000
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def calorie_target(p):
+    kg, cm, age = _num(p.get("weightKg")), _num(p.get("heightCm")), _num(p.get("age"))
+    if not (kg and cm and age):
+        return 2000
+    base = 10 * kg + 6.25 * cm - 5 * age
+    bmr = _jsround(base - 161 if p.get("sex") == "female" else base + 5)
+    tdee = _jsround(bmr * _FACTORS.get(p.get("activityLevel"), 1.55))
+    if not tdee:
+        return 2000
+    delta = _jsround((_num(p.get("paceKgPerWeek")) or 0.5) * 7700 / 7)
+    target = tdee
+    if p.get("goal") == "lose":
+        target = tdee - delta
+    elif p.get("goal") == "gain":
+        target = tdee + min(delta, 500)
+    return _jsround(max(target, 1200 if p.get("sex") == "female" else 1500))
+
+
+def protein_goal(p):
+    if _num(p.get("proteinGoal")) > 0:
+        return _jsround(_num(p["proteinGoal"]))
+    kg = _num(p.get("weightKg"))
+    if not kg:
+        ref = 70
+    else:
+        ref = kg
+        cm = _num(p.get("heightCm"))
+        if cm:
+            upper = round(24.9 * (cm / 100) ** 2 * 10) / 10
+            if kg > upper:
+                ref = (kg + upper) / 2
+        goal = _num(p.get("goalWeightKg"))
+        if goal and p.get("goal") == "lose":
+            ref = max(goal, min(ref, kg))
+    return _jsround(ref * (1.2 if p.get("goal") == "maintain" else 1.6))
+
+
+def water_goal_ml(p, exercise_min=0):
+    kg = _num(p.get("weightKg")) or 70
+    base = min(max(kg * 35, 1500), 4000)
+    if p.get("climate") == "hot":
+        base += 500
+    if p.get("pregnancy") == "pregnant":
+        base += 300
+    if p.get("pregnancy") == "breastfeeding":
+        base += 700
+    return _jsround((base + min(exercise_min, 240) * 12) / 50) * 50
+
+
+def goal_hits(profile, day, weighed, fast_hours, fasting_on):
+    day = day or {}
+    water = sum(_num(w.get("ml")) for w in day.get("water") or [])
+    food = day.get("food") or []
+    kcal = sum(_num(f.get("kcal")) for f in food)
+    protein = sum(_num(f.get("protein")) for f in food)
+    minutes = sum(_num(e.get("minutes")) for e in day.get("exercise") or [])
+    target = calorie_target(profile)
+    hits = {
+        "water": water >= water_goal_ml(profile, minutes),
+        "food": bool(food) and target * 0.5 <= kcal <= target,
+        "protein": bool(food) and protein >= protein_goal(profile),
+        "move": bool((day.get("workout") or {}).get("done")) or minutes > 0,
+        "weigh": bool(weighed),
+        "fast": fast_hours >= 12,
+    }
+    if not fasting_on:
+        hits["fast"] = None
+    return hits
 
 
 def make_handler(hub):
@@ -578,6 +734,9 @@ def make_handler(hub):
                     return self._send(200, hub.friends(tok))
                 if path == "/api/chat":
                     return self._send(200, hub.chat_list(tok, qint("since")))
+                if path == "/api/compare":
+                    today = q.get("today", [""])[0]
+                    return self._send(200, hub.compare(tok, qint("days", 7), today if DAY_RE.match(today) else None))
                 if path == "/api/dashboard/users":
                     return self._send(200, hub.dashboard_users(tok))
                 if path == "/api/dashboard/data":

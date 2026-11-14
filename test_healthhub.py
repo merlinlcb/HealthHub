@@ -211,6 +211,66 @@ class HubTest(unittest.TestCase):
             self.post_form("/download", {"code": "guess"})
         self.assertEqual(self.post_form("/download", {"code": "letmein"})[0], 429)
 
+    def test_goal_maths_match_the_app(self):
+        # Reference numbers printed by app/src/lib/calc.js for the same profiles.
+        ps = [
+            {"sex": "male", "age": 34, "heightCm": 180, "weightKg": 110, "goal": "lose", "paceKgPerWeek": 0.5,
+             "activityLevel": "light", "goalWeightKg": 90, "proteinGoal": None},
+            {"sex": "female", "age": 29, "heightCm": 165, "weightKg": 70, "goal": "maintain", "paceKgPerWeek": 0.5,
+             "activityLevel": "moderate", "proteinGoal": 0, "climate": "hot"},
+            {"sex": "male", "age": 40, "heightCm": 175, "weightKg": 80, "goal": "gain", "paceKgPerWeek": 1,
+             "activityLevel": "very", "proteinGoal": 170},
+        ]
+        got = [[healthhub.calorie_target(p), healthhub.protein_goal(p), healthhub.water_goal_ml(p, 0),
+                healthhub.water_goal_ml(p, 45)] for p in ps]
+        self.assertEqual(got, [[2283, 153, 3850, 4400], [2209, 83, 2950, 3500], [3431, 170, 2800, 3350]])
+
+    def test_compare_shares_only_weights_and_goal_hits(self):
+        tok, _ = self.signup("merlin")
+        tok_b, _ = self.signup("bro")
+        profile = {"sex": "male", "age": 34, "heightCm": 180, "weightKg": 100, "goal": "lose", "paceKgPerWeek": 0.5,
+                   "activityLevel": "light", "goalWeightKg": 90, "proteinGoal": 150, "units": "imperial"}
+        day = {"water": [{"ml": 4000}], "food": [{"kcal": 1500, "protein": 160, "name": "secret burrito"}],
+               "exercise": [], "workout": {"done": True}}
+        self.call("POST", "/api/sync", {
+            "profile": {"data": {"profile": profile, "fasting": {"enabled": True}}, "updatedAt": 5},
+            "stats": {"level": 7, "streak": 3},
+            "push": [
+                {"id": "day-2026-11-13", "kind": "day", "day": "2026-11-13", "ts": 1, "data": day, "updatedAt": 1},
+                {"id": "day-2026-11-12", "kind": "day", "day": "2026-11-12", "ts": 1,
+                 "data": {"water": [{"ml": 500}], "food": [{"kcal": 3000, "protein": 10}]}, "updatedAt": 1},
+                {"id": "wt-a", "kind": "weight", "day": "2026-11-01", "ts": 1, "data": {"kg": 102}, "updatedAt": 1},
+                {"id": "wt-b", "kind": "weight", "day": "2026-11-10", "ts": 2, "data": {"kg": 101}, "updatedAt": 1},
+                {"id": "wt-c", "kind": "weight", "day": "2026-11-13", "ts": 3, "data": {"kg": 100}, "updatedAt": 1},
+                {"id": "fast-1", "kind": "fast", "day": "2026-11-13", "ts": 1,
+                 "data": {"start": "2026-11-12T20:00:00.000Z", "end": "2026-11-13T09:00:00.000Z"}, "updatedAt": 1},
+            ]}, tok)
+        self.call("GET", "/api/compare", expect=401)
+        # The non-admin account can open it and sees both people.
+        hub = self.httpd.hub
+        r = hub.compare(tok_b, 7, today="2026-11-13")
+        self.assertEqual(r["days"][0], "2026-11-13")
+        self.assertEqual(len(r["days"]), 7)
+        m = next(p for p in r["people"] if p["displayName"] == "Merlin")
+        self.assertFalse(m["isMe"])
+        self.assertEqual((m["currentKg"], m["startKg"], m["goalKg"], m["level"]), (100, 102, 90, 7))
+        self.assertEqual(m["days"][0]["hits"],
+                         {"water": True, "food": True, "protein": True, "move": True, "weigh": True, "fast": True})
+        self.assertEqual(m["days"][1]["hits"],
+                         {"water": False, "food": False, "protein": False, "move": False, "weigh": False, "fast": False})
+        # Nothing but yes/no and weights leaves the server.
+        raw = json.dumps(r)
+        for leak in ("secret burrito", "1500", "4000", "160"):
+            self.assertNotIn(leak, raw)
+        b = next(p for p in r["people"] if p["displayName"] == "Bro")
+        self.assertIsNone(b["currentKg"])
+        # A shorter window starting after the first weigh-in uses the last weight before it.
+        self.assertEqual(next(p for p in hub.compare(tok, 3, today="2026-11-13")["people"] if p["isMe"])["startKg"], 101)
+        # Over HTTP too.
+        self.assertEqual(len(self.call("GET", "/api/compare?days=14", token=tok_b)["days"]), 14)
+        self.assertEqual(self.call("GET", "/api/compare?days=2&today=2026-11-13", token=tok_b)["days"], ["2026-11-13", "2026-11-12"])
+        self.assertEqual(len(self.call("GET", "/api/compare?days=2&today=bogus", token=tok_b)["days"]), 2)
+
     def test_bad_requests(self):
         self.call("GET", "/nope", expect=404)
         self.call("GET", "/healthz")
