@@ -576,59 +576,46 @@ function showMode() {
   if (foods) loadFoods();
 }
 
-// ── custom foods: everyone can see and edit everyone's ───────────────────────
+// ── custom foods: one list shared by everyone ────────────────────────────────
 const NUMS = [['kcal', 'Calories'], ['protein', 'Protein g'], ['carbs', 'Carbs g'], ['fat', 'Fat g'], ['fiber', 'Fiber g']];
-const fv = { people: [], editing: null, q: '', msg: '', err: false };
+const fv = { foods: [], editing: null, q: '', msg: '', err: false };
 
 async function loadFoods() {
   try {
-    fv.people = (await call('/api/customfoods')).people.sort((a, b) => (b.isMe - a.isMe) || a.id - b.id);
+    fv.foods = (await call('/api/customfoods')).foods;
   } catch (e) {
     if (e.status === 401) { memToken = ''; store.token = ''; return showLogin('Sign in again.'); }
-    fv.msg = e.message; fv.err = true;
+    say(e.message, true);
   }
   renderFoods();
 }
 
 function say(msg, err) { fv.msg = msg; fv.err = !!err; }
 
-async function saveFood(ownerIds, food) {
+async function saveFood(food) {
   try {
-    for (const id of ownerIds) await call('/api/customfoods/save', { ownerId: id, food });
-    const names = fv.people.filter(p => ownerIds.includes(p.id)).map(p => (p.isMe ? 'you' : p.displayName));
-    say(`Saved "${food.name}" for ${names.join(' and ')}. It shows up in the app after the next sync (about a minute while the app is open).`);
+    await call('/api/customfoods/save', { food });
+    say(`Saved "${food.name}". Everyone's app gets it at its next sync (about a minute while the app is open).`);
     fv.editing = null;
   } catch (e) { say(e.message, true); }
   await loadFoods();
 }
 
 function foodForm() {
-  const ed = fv.editing;
-  const f = ed ? ed.food : {};
+  const f = fv.editing || {};
   const input = (name, label, type, value, wide) => {
     const i = el('input', { type, name, autocomplete: 'off' });
     if (type === 'number') { i.min = '0'; i.step = 'any'; i.inputMode = 'decimal'; }
     if (value != null && value !== '') i.value = value;
     return el('label', wide ? { class: 'wide' } : {}, [document.createTextNode(label), i]);
   };
-  const form = el('form', {}, [
-    el('div', { class: 'fform' }, [
-      input('name', 'Food name', 'text', f.name, true),
-      input('servingLabel', 'Serving size (e.g. 1 bowl)', 'text', f.servingLabel, true),
-      ...NUMS.map(([k, l]) => input(k, l + ' per serving', 'number', f[k])),
-    ]),
-  ]);
-  if (ed) {
-    const owner = fv.people.find(p => p.id === ed.ownerId);
-    form.append(el('div', { class: 'forwho', text: `Editing ${owner && owner.isMe ? 'your' : (owner ? owner.displayName + "'s" : 'this')} food.` }));
-  } else {
-    form.append(el('div', { class: 'forwho' }, [el('span', { class: 'msg', text: 'Add to:' }),
-      ...fv.people.map(p => el('label', {}, [el('input', { type: 'checkbox', name: 'who', value: String(p.id), checked: '' }),
-        document.createTextNode(p.isMe ? `${p.displayName} (you)` : p.displayName)]))]));
-  }
-  const save = el('button', { class: 'sbtn', type: 'submit', text: ed ? 'Save changes' : 'Add food' });
-  const acts = el('div', { class: 'factions' }, [save]);
-  if (ed) {
+  const form = el('form', {}, el('div', { class: 'fform' }, [
+    input('name', 'Food name', 'text', f.name, true),
+    input('servingLabel', 'Serving size (e.g. 1 bowl)', 'text', f.servingLabel, true),
+    ...NUMS.map(([k, l]) => input(k, l + ' per serving', 'number', f[k])),
+  ]));
+  const acts = el('div', { class: 'factions' }, el('button', { class: 'sbtn', type: 'submit', text: fv.editing ? 'Save changes' : 'Add food' }));
+  if (fv.editing) {
     const cancel = el('button', { class: 'gbtn', type: 'button', text: 'Cancel' });
     cancel.addEventListener('click', () => { fv.editing = null; say(''); renderFoods(); });
     acts.append(cancel);
@@ -641,67 +628,52 @@ function foodForm() {
     const food = { name: String(d.get('name') || '').trim(), servingLabel: String(d.get('servingLabel') || '').trim() };
     for (const [k] of NUMS) food[k] = Number(d.get(k) || 0);
     if (!food.name) { say('Give the food a name.', true); return renderFoods(); }
-    if (ed) { food.id = ed.food.id; saveFood([ed.ownerId], food); }
-    else {
-      const who = d.getAll('who').map(Number);
-      if (!who.length) { say('Pick at least one person.', true); return renderFoods(); }
-      saveFood(who, food);
-    }
+    if (fv.editing) food.id = fv.editing.id;
+    saveFood(food);
   });
-  return el('section', { class: 'card wide' }, [el('h2', { text: ed ? 'Edit food' : 'Add a food' }),
-    el('div', { class: 'sub', text: 'Nutrition is per serving, like a label. Custom foods appear in the app under My foods and in search.' }), form]);
+  return el('section', { class: 'card wide' }, [el('h2', { text: fv.editing ? `Edit "${fv.editing.name}"` : 'Add a food' }),
+    el('div', { class: 'sub', text: 'Nutrition is per serving, like a label. Custom foods are shared: everyone sees them in the app under My foods and in search.' }), form]);
 }
 
 function renderFoods() {
-  const search = el('input', { class: 'fsearch', type: 'search', placeholder: 'Search custom foods', 'aria-label': 'Search custom foods' });
+  const search = el('input', { class: 'fsearch', type: 'search', placeholder: 'Search shared foods', 'aria-label': 'Search shared foods' });
   search.value = fv.q;
-  search.addEventListener('input', () => { fv.q = search.value; renderLists(); search.focus(); });
-  const lists = el('div', { class: 'charts' });
-  function renderLists() {
-    const q2 = fv.q.trim().toLowerCase();
-    lists.replaceChildren(...fv.people.map(p => {
-      const foods = p.foods.filter(f => !q2 || f.name.toLowerCase().includes(q2)).sort((a, b) => a.name.localeCompare(b.name));
-      const others = fv.people.filter(o => o.id !== p.id);
-      const rows = foods.map(f => {
-        const makeActs = () => {
+  const list = el('section', { class: 'card wide' });
+  function renderList() {
+    const q = fv.q.trim().toLowerCase();
+    const foods = fv.foods.filter(f => !q || f.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
+    const rows = foods.map(f => {
+      const makeActs = () => {
         const edit = el('button', { class: 'gbtn', type: 'button', text: 'Edit' });
-        edit.addEventListener('click', () => { fv.editing = { ownerId: p.id, food: f }; say(''); renderFoods(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
-        const acts = [edit];
-        for (const o of others) {
-          if (o.foods.some(x => x.name.toLowerCase() === f.name.toLowerCase())) continue;
-          const copy = el('button', { class: 'gbtn', type: 'button', text: `Copy to ${o.isMe ? 'me' : o.displayName}` });
-          copy.addEventListener('click', () => { const { id, ...rest } = f; saveFood([o.id], rest); });
-          acts.push(copy);
-        }
+        edit.addEventListener('click', () => { fv.editing = f; say(''); renderFoods(); window.scrollTo({ top: 0, behavior: 'smooth' }); });
         const del = el('button', { class: 'gbtn danger', type: 'button', text: 'Delete' });
         del.addEventListener('click', async () => {
-          if (del.dataset.armed !== '1') { del.dataset.armed = '1'; del.textContent = 'Really delete?'; return; }
-          try { await call('/api/customfoods/delete', { ownerId: p.id, id: f.id }); say(`Deleted "${f.name}".`); }
+          if (del.dataset.armed !== '1') { del.dataset.armed = '1'; del.textContent = 'Delete for everyone?'; return; }
+          try { await call('/api/customfoods/delete', { id: f.id }); say(`Deleted "${f.name}" for everyone.`); }
           catch (e) { say(e.message, true); }
           loadFoods();
         });
-        acts.push(del);
-        return acts;
-        };
-        return el('tr', {}, [
-          el('td', { class: 'fname' }, [document.createTextNode(f.name), el('small', { text: f.servingLabel }), el('div', { class: 'macts' }, makeActs())]),
-          el('td', { text: num(f.kcal) }), el('td', { text: num(f.protein, 1) }), el('td', { text: num(f.carbs, 1) }), el('td', { text: num(f.fat, 1) }),
-          el('td', { class: 'acts' }, makeActs()),
-        ]);
-      });
-      const body = rows.length
+        return [edit, del];
+      };
+      return el('tr', {}, [
+        el('td', { class: 'fname' }, [document.createTextNode(f.name),
+          el('small', { text: f.servingLabel + (f.addedBy ? ` · added by ${f.addedBy}` : '') }), el('div', { class: 'macts' }, makeActs())]),
+        el('td', { text: num(f.kcal) }), el('td', { text: num(f.protein, 1) }), el('td', { text: num(f.carbs, 1) }), el('td', { text: num(f.fat, 1) }),
+        el('td', { class: 'acts' }, makeActs()),
+      ]);
+    });
+    list.replaceChildren(el('h2', { text: 'Shared custom foods' }),
+      el('div', { class: 'sub', text: `${fv.foods.length} food${fv.foods.length === 1 ? '' : 's'}` }),
+      rows.length
         ? el('div', { class: 'tablewrap', style: 'max-height:none' }, el('table', {}, [
             el('thead', {}, el('tr', {}, ['Food', 'kcal', 'Protein', 'Carbs', 'Fat', ''].map(h => el('th', { scope: 'col', text: h })))),
             el('tbody', {}, rows)]))
-        : el('div', { class: 'empty', text: q2 ? 'No matches.' : 'No custom foods yet.' });
-      return el('section', { class: 'card wide' }, [
-        el('h2', { text: p.isMe ? `Your foods` : `${p.displayName}'s foods` }),
-        el('div', { class: 'sub', text: `${p.foods.length} custom food${p.foods.length === 1 ? '' : 's'}` }), body]);
-    }));
+        : el('div', { class: 'empty', text: q ? 'No matches.' : 'No custom foods yet. Add one here or with “＋ Create food” in the app.' }));
   }
-  renderLists();
+  search.addEventListener('input', () => { fv.q = search.value; renderList(); });
+  renderList();
   $('foodsView').replaceChildren(el('div', { class: 'charts', style: 'margin-bottom:12px' }, foodForm()),
-    el('div', { style: 'margin-bottom:12px' }, search), lists);
+    el('div', { style: 'margin-bottom:12px' }, search), list);
 }
 
 async function loadCompare() {

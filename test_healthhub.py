@@ -271,41 +271,64 @@ class HubTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/compare?days=2&today=2026-11-13", token=tok_b)["days"], ["2026-11-13", "2026-11-12"])
         self.assertEqual(len(self.call("GET", "/api/compare?days=2&today=bogus", token=tok_b)["days"]), 2)
 
-    def test_custom_foods_can_be_seen_and_edited_by_anyone_and_reach_the_phone(self):
+    def test_custom_foods_are_shared_automatically(self):
         tok, merlin = self.signup("merlin")
         tok_b, bro = self.signup("bro")
-        settings = {"profile": {"name": "Bro"}, "customFoods": [
-            {"id": "my-abc", "name": "Chili", "servingLabel": "1 bowl", "kcal": 400, "protein": 30}],
-            "favorites": ["my-abc", "db-banana"], "recentFoods": [{"foodId": "my-abc", "qty": 1}]}
-        self.call("POST", "/api/sync", {"profile": {"data": settings, "updatedAt": 1000}}, tok_b)
+        m_settings = {"profile": {"name": "Merlin"}, "customFoods": [], "favorites": []}
+        self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": 900}}, tok)
+        chili = {"id": "my-abc", "name": "Chili", "servingLabel": "1 bowl", "kcal": 400, "protein": 30,
+                 "carbs": 20, "fat": 15, "fiber": 5}
+        b_settings = {"profile": {"name": "Bro"}, "customFoods": [chili],
+                      "favorites": ["my-abc", "db-banana"], "recentFoods": [{"foodId": "my-abc", "qty": 1}]}
+        # Bro's phone uploads a new custom food; his own list comes back unchanged (nothing new for him).
+        r = self.call("POST", "/api/sync", {"profile": {"data": b_settings, "updatedAt": 1000}}, tok_b)
+        self.assertIsNone(r["profile"])
+        # Merlin's phone (settings unchanged since 900) gets Bro's food on its next sync.
+        r = self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": 900}}, tok)
+        self.assertEqual(r["profile"]["data"]["customFoods"], [chili])
+        self.assertEqual(r["profile"]["data"]["profile"], {"name": "Merlin"})  # nothing else touched
+        m_settings, m_at = r["profile"]["data"], r["profile"]["updatedAt"]
+        # Merlin creates a food in his app; it reaches Bro.
+        toast = {"id": "my-xyz", "name": "Toast", "servingLabel": "1 slice", "kcal": 90, "protein": 3,
+                 "carbs": 15, "fat": 1, "fiber": 1}
+        m_settings = {**m_settings, "customFoods": m_settings["customFoods"] + [toast]}
+        self.assertIsNone(self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": m_at + 5}}, tok)["profile"])
+        r = self.call("POST", "/api/sync", {"profile": {"data": b_settings, "updatedAt": 1000}}, tok_b)
+        self.assertEqual([f["name"] for f in r["profile"]["data"]["customFoods"]], ["Chili", "Toast"])
+        b_settings, b_at = r["profile"]["data"], r["profile"]["updatedAt"]
+        # The web page shows one list with who added each food.
         self.call("GET", "/api/customfoods", expect=401)
-        people = self.call("GET", "/api/customfoods", token=tok)["people"]
-        b = next(p for p in people if p["displayName"] == "Bro")
-        self.assertEqual(b["foods"][0]["name"], "Chili")
-        # Merlin edits Bro's chili and adds a food to Bro's list.
-        self.call("POST", "/api/customfoods/save", {"ownerId": bro["id"], "food": {"id": "my-abc", "name": "Chili (big)",
-                  "servingLabel": "1 bowl", "kcal": 520, "protein": 38}}, tok)
-        added = self.call("POST", "/api/customfoods/save", {"ownerId": bro["id"], "food": {"name": "Protein pancakes",
-                          "kcal": 300, "protein": 25}}, tok)["food"]
-        self.assertTrue(added["id"].startswith("my-"))
-        self.call("POST", "/api/customfoods/save", {"ownerId": bro["id"], "food": {"name": ""}}, tok, expect=400)
-        self.call("POST", "/api/customfoods/save", {"ownerId": bro["id"], "food": {"id": "nope", "name": "x"}}, tok, expect=404)
-        self.call("POST", "/api/customfoods/save", {"ownerId": 999, "food": {"name": "x"}}, tok, expect=404)
-        # Bro's phone (settings last pushed at 1000, unchanged since) pulls the newer list on its next sync.
-        r = self.call("POST", "/api/sync", {"profile": {"data": settings, "updatedAt": 1000}}, tok_b)
+        foods = self.call("GET", "/api/customfoods", token=tok)["foods"]
+        self.assertEqual([(f["name"], f["addedBy"]) for f in foods], [("Chili", "Bro"), ("Toast", "Merlin")])
+        # Editing on the web changes it for everyone, and an older copy from a phone can't undo it.
+        self.call("POST", "/api/customfoods/save", {"food": {**chili, "name": "Chili (big)", "kcal": 520}}, tok)
+        self.call("POST", "/api/sync", {"profile": {"data": {**b_settings, "customFoods": [chili, toast]},
+                                                    "updatedAt": b_at + 1}}, tok_b)
+        r = self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": m_at + 5}}, tok)
+        self.assertEqual(r["profile"]["data"]["customFoods"][0]["name"], "Chili (big)")
+        self.assertEqual(r["profile"]["data"]["customFoods"][0]["kcal"], 520)
+        # Adding on the web reaches everyone; bad input is refused.
+        self.call("POST", "/api/customfoods/save", {"food": {"name": "Pancakes", "kcal": 300}}, tok_b)
+        self.call("POST", "/api/customfoods/save", {"food": {"name": ""}}, tok, expect=400)
+        self.call("POST", "/api/customfoods/save", {"food": {"id": "nope", "name": "x"}}, tok, expect=404)
+        # Deleting removes it for everyone (including favourites and recents), and it stays deleted
+        # even when a phone that has not synced yet still has it.
+        self.call("POST", "/api/customfoods/delete", {"id": "my-abc"}, tok)
+        self.call("POST", "/api/customfoods/delete", {"id": "my-abc"}, tok, expect=404)
+        r = self.call("POST", "/api/sync", {"profile": {"data": {**b_settings, "customFoods": [chili, toast]},
+                                                        "updatedAt": b_at + 50}}, tok_b)
         got = r["profile"]["data"]
-        self.assertEqual([f["name"] for f in got["customFoods"]], ["Chili (big)", "Protein pancakes"])
-        self.assertEqual(got["customFoods"][0]["kcal"], 520)
-        self.assertEqual(got["profile"], {"name": "Bro"})  # the rest of the settings are untouched
-        # Deleting also drops it from favourites and recent foods, like the app does.
-        self.call("POST", "/api/customfoods/delete", {"ownerId": bro["id"], "id": "my-abc"}, tok)
-        got = self.call("POST", "/api/sync", {"profile": {"data": settings, "updatedAt": 1000}}, tok_b)["profile"]["data"]
-        self.assertEqual([f["name"] for f in got["customFoods"]], ["Protein pancakes"])
+        self.assertEqual([f["name"] for f in got["customFoods"]], ["Toast", "Pancakes"])
         self.assertEqual(got["favorites"], ["db-banana"])
         self.assertEqual(got["recentFoods"], [])
-        # A person who never synced settings can still be given foods.
-        self.call("POST", "/api/customfoods/save", {"ownerId": merlin["id"], "food": {"name": "Toast", "kcal": 90}}, tok_b)
-        self.assertEqual(self.call("POST", "/api/sync", {}, tok)["profile"]["data"]["customFoods"][0]["name"], "Toast")
+        self.assertEqual([f["name"] for f in self.call("GET", "/api/customfoods", token=tok)["foods"]], ["Toast", "Pancakes"])
+
+    def test_foods_made_before_sharing_are_picked_up_at_start(self):
+        tok, _ = self.signup("merlin")
+        self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [
+            {"id": "my-1", "name": "Old food", "kcal": 10}]}, "updatedAt": 5}}, tok)
+        hub = healthhub.Hub(self.tmp.name, "letmein")  # a restart
+        self.assertEqual([f["name"] for f in hub.custom_foods(tok)["foods"]], ["Old food"])
 
     def test_bad_requests(self):
         self.call("GET", "/nope", expect=404)
