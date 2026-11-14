@@ -1,0 +1,29 @@
+[Unit]
+Description=HealthHub (Health Tracker sync, chat and dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=healthhub
+Group=healthhub
+# /etc/healthhub.env holds HT_INVITE_CODE=... (mode 0600, owned by root)
+EnvironmentFile=/etc/healthhub.env
+Environment=HT_DATA=/var/lib/healthhub HT_PORT=8787 HT_BIND=0.0.0.0
+ExecStart=/usr/bin/python3 /opt/healthhub/healthhub.py
+Restart=on-failure
+RestartSec=3
+StateDirectory=healthhub
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/lib/healthhub
+
+[Install]
+WantedBy=multi-user.target
