@@ -318,13 +318,21 @@ class HubTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/compare?days=2&today=2026-11-13", token=tok_b)["days"], ["2026-11-13", "2026-11-12"])
         self.assertEqual(len(self.call("GET", "/api/compare?days=2&today=bogus", token=tok_b)["days"]), 2)
 
+    def test_shared_foods_say_who_added_them(self):
+        tok, merlin = self.signup("merlin")
+        oats = {"id": "my-oats", "name": "Oats", "servingLabel": "1 cup", "kcal": 300, "protein": 10, "carbs": 50, "fat": 5, "fiber": 8}
+        # A food made before the phone knew its user id comes back tagged.
+        r = self.call("POST", "/api/sync", {"profile": {"data": {"customFoods": [oats]}, "updatedAt": 5}}, tok)
+        self.assertEqual(r["profile"]["data"]["customFoods"][0]["by"], merlin["id"])
+
     def test_custom_foods_are_shared_automatically(self):
         tok, merlin = self.signup("merlin")
         tok_b, bro = self.signup("bro")
         m_settings = {"profile": {"name": "Merlin"}, "customFoods": [], "favorites": []}
         self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": 900}}, tok)
+        # Phones tag the foods they create with their user id ("by"); the server keeps it.
         chili = {"id": "my-abc", "name": "Chili", "servingLabel": "1 bowl", "kcal": 400, "protein": 30,
-                 "carbs": 20, "fat": 15, "fiber": 5}
+                 "carbs": 20, "fat": 15, "fiber": 5, "by": bro["id"]}
         b_settings = {"profile": {"name": "Bro"}, "customFoods": [chili],
                       "favorites": ["my-abc", "db-banana"], "recentFoods": [{"foodId": "my-abc", "qty": 1}]}
         # Bro's phone uploads a new custom food; his own list comes back unchanged (nothing new for him).
@@ -337,7 +345,7 @@ class HubTest(unittest.TestCase):
         m_settings, m_at = r["profile"]["data"], r["profile"]["updatedAt"]
         # Merlin creates a food in his app; it reaches Bro.
         toast = {"id": "my-xyz", "name": "Toast", "servingLabel": "1 slice", "kcal": 90, "protein": 3,
-                 "carbs": 15, "fat": 1, "fiber": 1}
+                 "carbs": 15, "fat": 1, "fiber": 1, "by": merlin["id"]}
         m_settings = {**m_settings, "customFoods": m_settings["customFoods"] + [toast]}
         self.assertIsNone(self.call("POST", "/api/sync", {"profile": {"data": m_settings, "updatedAt": m_at + 5}}, tok)["profile"])
         r = self.call("POST", "/api/sync", {"profile": {"data": b_settings, "updatedAt": 1000}}, tok_b)

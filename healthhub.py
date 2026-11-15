@@ -782,8 +782,9 @@ class Hub:
                 keep[k] = r["id"]
 
     def _pool(self, conn):
-        rows = conn.execute("SELECT data FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall()
-        return [json.loads(r["data"]) for r in rows]
+        # "by": who added the food (user id), so each phone can tell its own foods from the group's.
+        rows = conn.execute("SELECT data, added_by FROM shared_foods WHERE deleted=0 ORDER BY created, id").fetchall()
+        return [{**json.loads(r["data"]), "by": r["added_by"]} for r in rows]
 
     def _spread_foods(self, conn):
         """Give every person the full shared list; returns how many settings changed."""
