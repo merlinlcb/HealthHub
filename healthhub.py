@@ -13,7 +13,8 @@ Configuration (environment):
   HT_UPLOAD_TOKEN secret that lets a build upload new APKs to /api/app/upload (optional)
   HT_GITHUB_TOKEN read-only GitHub token; the server then checks the repo's latest release
                   every 15 minutes and offers any newer APK as an update (optional)
-  HT_GITHUB_REPO  owner/repo to check                (default merlinlcb/HealthTracker)
+  HT_GITHUB_REPO  owner/repo whose releases to check  (default merlinlcb/HealthTracker)
+  HT_ACCESS_LOG   set to anything to log every request (optional)
 """
 import datetime
 import hashlib

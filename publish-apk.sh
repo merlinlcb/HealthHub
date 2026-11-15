@@ -1,6 +1,6 @@
 #!/bin/sh
 # Put an APK on the server so /get hands it out and the app announces the update.
-#   server/publish-apk.sh <ssh-host> <apk> <versionCode> <versionName>
+#   ./publish-apk.sh <ssh-host> <apk> <versionCode> <versionName>
 # e.g. the APK from a GitHub release, or app/android/app/build/outputs/apk/release/app-release.apk
 set -eu
 HOST="${1:?usage: publish-apk.sh <ssh-host> <apk> <versionCode> <versionName>}"
