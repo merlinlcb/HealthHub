@@ -107,7 +107,30 @@ CREATE TABLE IF NOT EXISTS messages (
   body TEXT NOT NULL,
   ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS invites (
+  code TEXT PRIMARY KEY,
+  created_by INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  created INTEGER NOT NULL,
+  expires INTEGER NOT NULL,
+  used_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  used_at INTEGER
+);
 """
+
+INVITE_TTL = 7 * 24 * 3600 * 1000      # one-time invite codes last a week
+INVITE_MAX_OPEN = 10                   # unused codes one person can have at a time
+INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
+
+
+def new_invite_code():
+    raw = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(8))
+    return raw[:4] + "-" + raw[4:]
+
+
+def clean_invite(code):
+    """'abcd efgh', 'ABCD-EFGH' -> 'ABCD-EFGH' (None if it can't be one of ours)."""
+    raw = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper()
+    return raw[:4] + "-" + raw[4:] if len(raw) == 8 else None
 
 
 def now_ms():
@@ -197,10 +220,12 @@ class Hub:
     def register(self, body):
         if self._throttled("register"):
             raise ApiError(429, "Too many attempts. Try again in a few minutes.")
-        invite = str(body.get("invite") or "")
-        if not hmac.compare_digest(invite.encode(), self.invite_code.encode()):
+        invite = str(body.get("invite") or "").strip()
+        master = hmac.compare_digest(invite.encode(), self.invite_code.encode())
+        one_time = None if master else clean_invite(invite)
+        if not master and not (one_time and self._invite_open(one_time)):
             self._note_failure("register")
-            raise ApiError(403, "That invite code is not right.")
+            raise ApiError(403, "That invite code is not right, or it has been used or has expired.")
         username = str(body.get("username") or "").strip().lower()
         display = str(body.get("displayName") or "").strip()[:40] or username
         password = str(body.get("password") or "")
@@ -221,6 +246,13 @@ class Hub:
                 " VALUES (?,?,?,?,?,?)",
                 (username, display, salt, pw, 1 if first else 0, now_ms()),
             )
+            if one_time:
+                used = conn.execute(
+                    "UPDATE invites SET used_by=?, used_at=? WHERE code=? AND used_by IS NULL AND expires>?",
+                    (cur.lastrowid, now_ms(), one_time, now_ms()),
+                ).rowcount
+                if not used:  # taken by someone else a moment ago
+                    raise ApiError(403, "That invite code has just been used.")
             token = self._issue_token(conn, cur.lastrowid, body.get("device"))
             row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
             conn.execute("COMMIT")
@@ -415,6 +447,68 @@ class Hub:
         finally:
             conn.close()
 
+    # ── one-time invite codes ─────────────────────────────────────────────
+    def _invite_open(self, code):
+        conn = self.db()
+        try:
+            return bool(conn.execute("SELECT 1 FROM invites WHERE code=? AND used_by IS NULL AND expires>?", (code, now_ms())).fetchone())
+        finally:
+            conn.close()
+
+    def _invite_rows(self, conn, me):
+        rows = conn.execute(
+            "SELECT i.*, u.display_name used_name FROM invites i LEFT JOIN users u ON u.id=i.used_by"
+            " WHERE i.created_by=? AND (i.used_by IS NOT NULL OR i.expires>?) ORDER BY i.created DESC LIMIT 30",
+            (me["id"], now_ms()),
+        )
+        return [{"code": r["code"], "created": r["created"], "expires": r["expires"],
+                 "usedBy": r["used_name"] if r["used_by"] else None, "usedAt": r["used_at"]} for r in rows]
+
+    def invites(self, token):
+        """My invite codes: open ones and the ones that were used."""
+        conn = self.db()
+        try:
+            return {"invites": self._invite_rows(conn, self.authenticate(conn, token))}
+        finally:
+            conn.close()
+
+    def create_invite(self, token):
+        """A one-time code for someone new: works once, for a week, to sign up and to download the app."""
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
+            conn.execute("BEGIN IMMEDIATE")
+            open_count = conn.execute(
+                "SELECT COUNT(*) c FROM invites WHERE created_by=? AND used_by IS NULL AND expires>?", (me["id"], now_ms())
+            ).fetchone()["c"]
+            if open_count >= INVITE_MAX_OPEN:
+                raise ApiError(429, "You already have %d unused invite codes. Share or cancel one of those first." % INVITE_MAX_OPEN)
+            t = now_ms()
+            for _ in range(5):
+                code = new_invite_code()
+                if not conn.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
+                    break
+            conn.execute("INSERT INTO invites (code, created_by, created, expires) VALUES (?,?,?,?)", (code, me["id"], t, t + INVITE_TTL))
+            conn.execute("COMMIT")
+            return {"code": code, "expires": t + INVITE_TTL, "invites": self._invite_rows(conn, me)}
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def cancel_invite(self, token, body):
+        conn = self.db()
+        try:
+            me = self.authenticate(conn, token)
+            code = clean_invite(body.get("code"))
+            conn.execute("DELETE FROM invites WHERE code=? AND created_by=? AND used_by IS NULL", (code, me["id"]))
+            conn.commit()
+            return {"invites": self._invite_rows(conn, me)}
+        finally:
+            conn.close()
+
     # ── chat ──────────────────────────────────────────────────────────────
     def chat_list(self, token, since, limit=200):
         conn = self.db()
@@ -484,7 +578,10 @@ class Hub:
             message = "Wrong username or password."
         else:
             ok = hmac.compare_digest(str(code or "").strip().encode(), self.invite_code.encode())
-            message = "That invite code is not right."
+            if not ok:
+                one_time = clean_invite(code)
+                ok = bool(one_time) and self._invite_open(one_time)
+            message = "That invite code is not right, or it has been used or has expired."
         if not ok:
             self._note_failure("apk")
             raise ApiError(403, message)
@@ -1145,6 +1242,8 @@ def make_handler(hub):
                     return self._send(200, hub.custom_foods(tok))
                 if path == "/api/notes":
                     return self._send(200, hub.notes(tok))
+                if path == "/api/invites":
+                    return self._send(200, hub.invites(tok))
                 if path == "/api/compare":
                     today = q.get("today", [""])[0]
                     return self._send(200, hub.compare(tok, qint("days", 7), today if DAY_RE.match(today) else None))
@@ -1196,6 +1295,10 @@ def make_handler(hub):
                     return self._send(200, hub.save_custom_food(tok, body))
                 if path == "/api/customfoods/delete":
                     return self._send(200, hub.delete_custom_food(tok, body))
+                if path == "/api/invites":
+                    return self._send(200, hub.create_invite(tok))
+                if path == "/api/invites/cancel":
+                    return self._send(200, hub.cancel_invite(tok, body))
             raise ApiError(404, "Not found.")
 
         def _handle(self, method):

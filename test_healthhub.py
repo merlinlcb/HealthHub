@@ -63,6 +63,50 @@ class HubTest(unittest.TestCase):
         self.call("POST", "/api/register",
                   {"invite": "letmein", "username": "ab", "password": "short"}, expect=400)
 
+    def test_one_time_invite_codes(self):
+        tok, _ = self.signup("merlin")
+        self.call("POST", "/api/invites", {}, expect=401)  # signed-in people only
+        r = self.call("POST", "/api/invites", {}, token=tok)
+        code = r["code"]
+        self.assertRegex(code, r"^[A-Z2-9]{4}-[A-Z2-9]{4}$")
+        self.assertEqual([i["code"] for i in r["invites"]], [code])
+        # Works once, typed any way, and the friend shows up as having used it.
+        _, friend = self.call("POST", "/api/register", {"invite": code.lower().replace("-", " "), "username": "friend", "password": "password1"}).values()
+        self.assertFalse(friend["isAdmin"])
+        self.call("POST", "/api/register", {"invite": code, "username": "friend2", "password": "password1"}, expect=403)
+        used = self.call("GET", "/api/invites", token=tok)["invites"]
+        self.assertEqual((used[0]["code"], used[0]["usedBy"]), (code, "friend"))
+        # A failed sign-up (bad password) does not use the code up.
+        code2 = self.call("POST", "/api/invites", {}, token=tok)["code"]
+        self.call("POST", "/api/register", {"invite": code2, "username": "pal", "password": "short"}, expect=400)
+        self.call("POST", "/api/register", {"invite": code2, "username": "pal", "password": "password1"})
+        # Cancelled and expired codes don't work.
+        code3 = self.call("POST", "/api/invites", {}, token=tok)["code"]
+        self.call("POST", "/api/invites/cancel", {"code": code3}, token=tok)
+        self.call("POST", "/api/register", {"invite": code3, "username": "pal3", "password": "password1"}, expect=403)
+        code4 = self.call("POST", "/api/invites", {}, token=tok)["code"]
+        conn = self.httpd.hub.db()
+        conn.execute("UPDATE invites SET expires=1 WHERE code=?", (code4,))
+        conn.close()
+        self.call("POST", "/api/register", {"invite": code4, "username": "pal4", "password": "password1"}, expect=403)
+        # The main code still works.
+        self.signup("bro")
+
+    def test_invite_code_limit_and_app_download(self):
+        tok, _ = self.signup("merlin")
+        codes = [self.call("POST", "/api/invites", {}, token=tok)["code"] for _ in range(healthhub.INVITE_MAX_OPEN)]
+        self.call("POST", "/api/invites", {}, token=tok, expect=429)
+        folder = os.path.join(self.tmp.name, "apk")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "HealthTracker.apk"), "wb") as fh:
+            fh.write(b"PK\x03\x04" + b"x" * 1000)
+        with open(os.path.join(folder, "version.json"), "w") as fh:
+            json.dump({"versionCode": 2, "versionName": "2.0.0"}, fh)
+        # An unused invite code also unlocks the /get download, without using the code up.
+        self.assertEqual(self.post_form("/download", {"code": codes[0]})[0], 200)
+        self.call("POST", "/api/register", {"invite": codes[0], "username": "friend", "password": "password1"})
+        self.assertEqual(self.post_form("/download", {"code": codes[0]})[0], 403)
+
     def test_login_logout_and_throttle(self):
         self.signup("merlin")
         tok = self.call("POST", "/api/login", {"username": "Merlin", "password": "password1"})["token"]
