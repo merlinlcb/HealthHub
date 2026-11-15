@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install or update HealthHub on a Debian/Ubuntu host you can ssh to as root.
-#   server/deploy.sh <ssh-host>
+#   ./deploy.sh <ssh-host>
 # First run creates the user, the service and a random invite code (printed once
 # and kept in /etc/healthhub.env). Later runs only update the code and restart.
 set -eu
@@ -21,7 +21,7 @@ tar -cf - healthhub.py healthhub.service static | ssh "$HOST" '
   if [ ! -f /etc/healthhub.env ]; then
     code=$(python3 -c "import secrets; print(secrets.token_urlsafe(9))")
     ( umask 077; echo "HT_INVITE_CODE=$code" > /etc/healthhub.env )
-    echo "Invite code (share with your brother): $code"
+    echo "Invite code (share it with the people you want in your group): $code"
   fi
   if ! grep -q "^HT_UPLOAD_TOKEN=" /etc/healthhub.env; then
     up=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
