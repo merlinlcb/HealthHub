@@ -14,6 +14,8 @@ Configuration (environment):
   HT_GITHUB_TOKEN read-only GitHub token; the server then checks the repo's latest release
                   every 15 minutes and offers any newer APK as an update (optional)
   HT_GITHUB_REPO  owner/repo whose releases to check  (default merlinlcb/HealthTracker)
+  HT_FOSSFITNESS_REPO  owner/repo of FossFitness releases (tags vA.B.C, asset FossFitness.apk) to offer
+                  to FossFitness installs, checked every 15 minutes (optional; a public repo needs no token)
   HT_ACCESS_LOG   set to anything to log every request (optional)
 """
 import datetime
@@ -40,6 +42,29 @@ MAX_SETTINGS = 512 * 1024
 MAX_BODY = 8 * 1024 * 1024
 MAX_APK = 200 * 1024 * 1024
 LINK_TTL = 15 * 60
+HANDOFF_TTL = 10 * 60
+
+# Update channels: the app sends ?app=<channel>. Old Health Tracker builds send nothing and get the
+# default channel, which is how they receive the build that moves them to FossFitness.
+CHANNELS = {
+    "healthtracker": ("apk", "HealthTracker.apk"),
+    "fossfitness": ("apk-fossfitness", "FossFitness.apk"),
+}
+DEFAULT_CHANNEL = "healthtracker"
+
+
+def channel_of(name):
+    name = str(name or "").strip().lower()
+    return name if name in CHANNELS else DEFAULT_CHANNEL
+
+
+def fossfitness_code(tag):
+    """FossFitness tags are vA.B.C and the Android versionCode is A*1000 + B*100 + C (2.1.0 -> 2100)."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", str(tag or ""))
+    if not m or int(m.group(2)) > 9 or int(m.group(3)) > 99:
+        return None, None
+    a, b, c = (int(x) for x in m.groups())
+    return "%d.%d.%d" % (a, b, c), a * 1000 + b * 100 + c
 MAX_PUSH = 20000
 MAX_MSG = 2000
 ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,80}$")
@@ -158,7 +183,8 @@ class Hub:
 
     def __init__(self, data_dir, invite_code, upload_token=""):
         self.upload_token = upload_token or ""
-        self._links = {}  # one-off download links: token -> expiry time
+        self._links = {}  # one-off download links: token -> (expiry time, channel)
+        self._handoffs = {}  # one-time codes that move a sign-in to FossFitness: code -> (expiry, user id)
         if not invite_code:
             raise ValueError("an invite code is required")
         os.makedirs(data_dir, exist_ok=True)
@@ -172,6 +198,11 @@ class Hub:
             if "profile_client_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(users)")}:
                 # When the person's phone last sent settings (as opposed to the server updating them).
                 conn.execute("ALTER TABLE users ADD COLUMN profile_client_at INTEGER NOT NULL DEFAULT 0")
+            tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tokens)")}
+            if "app" not in tcols:
+                # Which app (and build) each signed-in device runs, to follow the move to FossFitness.
+                conn.execute("ALTER TABLE tokens ADD COLUMN app TEXT")
+                conn.execute("ALTER TABLE tokens ADD COLUMN app_version INTEGER")
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(shared_foods)")}
             if "merged_into" not in cols:
                 conn.execute("ALTER TABLE shared_foods ADD COLUMN merged_into TEXT")
@@ -423,6 +454,14 @@ class Hub:
                              (blob, now_ms(), uid))
             conn.execute("UPDATE tokens SET last_used=? WHERE token_hash=?",
                          (now_ms(), token_hash(token)))
+            client = body.get("client")
+            if isinstance(client, dict):
+                try:
+                    app_version = int(client.get("version") or 0)
+                except (TypeError, ValueError):
+                    app_version = 0
+                conn.execute("UPDATE tokens SET app=?, app_version=? WHERE token_hash=?",
+                             (str(client.get("app") or "")[:80], app_version, token_hash(token)))
             conn.execute("COMMIT")
             return {"rev": rev, "entries": pulled, "profile": profile_out, "accepted": accepted,
                     "user": self._user_public(user)}
@@ -549,10 +588,14 @@ class Hub:
 
     # ── app download ──────────────────────────────────────────────────────
     # Put the build at <HT_DATA>/apk/HealthTracker.apk with a version.json
-    # beside it: {"versionCode": 2, "versionName": "2.0.0"}.
-    def apk_info(self):
-        folder = os.path.join(os.path.dirname(self.db_path), "apk")
-        apk = os.path.join(folder, "HealthTracker.apk")
+    # beside it: {"versionCode": 2, "versionName": "2.0.0"}. FossFitness: <HT_DATA>/apk-fossfitness/.
+    def _apk_folder(self, channel):
+        folder, name = CHANNELS[channel_of(channel)]
+        return os.path.join(os.path.dirname(self.db_path), folder), name
+
+    def apk_info(self, channel=DEFAULT_CHANNEL):
+        folder, name = self._apk_folder(channel)
+        apk = os.path.join(folder, name)
         info = {"available": os.path.isfile(apk), "versionCode": 0, "versionName": ""}
         try:
             with open(os.path.join(folder, "version.json"), encoding="utf-8") as fh:
@@ -588,33 +631,68 @@ class Hub:
             raise ApiError(403, message)
         return self._apk_or_404()
 
-    def _apk_or_404(self):
-        apk, info = self.apk_info()
+    def _apk_or_404(self, channel=DEFAULT_CHANNEL):
+        apk, info = self.apk_info(channel)
         if not info["available"]:
             raise ApiError(404, "No app build has been uploaded yet.")
         return apk, info
 
-    def apk_link(self, token):
+    def apk_link(self, token, channel=DEFAULT_CHANNEL):
         """A short-lived download link for a signed-in app (a browser can't send our sign-in header)."""
+        channel = channel_of(channel)
         conn = self.db()
         try:
             self.authenticate(conn, token)
         finally:
             conn.close()
-        _, info = self._apk_or_404()
+        _, info = self._apk_or_404(channel)
         t = time.time()
         with self._fail_lock:
-            self._links = {k: v for k, v in self._links.items() if v > t}
+            self._links = {k: v for k, v in self._links.items() if v[0] > t}
             link = secrets.token_urlsafe(24)
-            self._links[link] = t + LINK_TTL
+            self._links[link] = (t + LINK_TTL, channel)
         return {"url": "/dl/" + link, "versionCode": info["versionCode"], "versionName": info["versionName"]}
 
     def apk_for_link(self, link):
         with self._fail_lock:
-            expiry = self._links.get(link)
-        if not expiry or expiry < time.time():
+            expiry, channel = self._links.get(link) or (0, DEFAULT_CHANNEL)
+        if expiry < time.time():
             raise ApiError(404, "This download link has expired. Open the update from the app again.")
-        return self._apk_or_404()
+        return self._apk_or_404(channel)
+
+    # ── moving a signed-in device from Health Tracker to FossFitness ──────
+    def handoff_start(self, token):
+        """Signed-in old app: a one-time code the new app on the same phone trades for its own sign-in."""
+        conn = self.db()
+        try:
+            user = self.authenticate(conn, token)
+        finally:
+            conn.close()
+        t = time.time()
+        with self._fail_lock:
+            self._handoffs = {k: v for k, v in self._handoffs.items() if v[0] > t}
+            code = secrets.token_urlsafe(24)
+            self._handoffs[code] = (t + HANDOFF_TTL, user["id"])
+        return {"code": code, "expiresIn": HANDOFF_TTL}
+
+    def handoff_claim(self, body):
+        if self._throttled("handoff"):
+            raise ApiError(429, "Too many attempts. Try again in a few minutes.")
+        code = str(body.get("code") or "")
+        with self._fail_lock:
+            expiry, user_id = self._handoffs.pop(code, (0, None))
+        if expiry < time.time():
+            self._note_failure("handoff")
+            raise ApiError(404, "This move has expired. Start it again from the old app.")
+        conn = self.db()
+        try:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "That account no longer exists.")
+            token = self._issue_token(conn, row["id"], body.get("device"))
+            return {"token": token, "user": self._user_public(row)}
+        finally:
+            conn.close()
 
     def store_apk(self, auth_header, stream, length, version_code, version_name):
         """Called by the build (GitHub Actions): replace the APK the app offers as an update."""
@@ -623,7 +701,7 @@ class Hub:
             raise ApiError(403, "Not allowed.")
         return self._install_apk(stream, length, version_code, version_name)
 
-    def _install_apk(self, stream, length, version_code, version_name):
+    def _install_apk(self, stream, length, version_code, version_name, channel=DEFAULT_CHANNEL):
         try:
             code = int(version_code)
         except (TypeError, ValueError):
@@ -632,7 +710,7 @@ class Hub:
             raise ApiError(400, "Bad version.")
         if not 1000 < length <= MAX_APK:
             raise ApiError(400, "That is not an APK.")
-        folder = os.path.join(os.path.dirname(self.db_path), "apk")
+        folder, name = self._apk_folder(channel)
         os.makedirs(folder, exist_ok=True)
         tmp = os.path.join(folder, "upload.tmp")
         left = length
@@ -652,11 +730,11 @@ class Hub:
         if left:
             os.remove(tmp)
             raise ApiError(400, "Upload was cut short.")
-        _, current = self.apk_info()
+        _, current = self.apk_info(channel)
         if current["available"] and code < current["versionCode"]:
             os.remove(tmp)
             raise ApiError(409, "The server already has a newer version (%d)." % current["versionCode"])
-        os.replace(tmp, os.path.join(folder, "HealthTracker.apk"))
+        os.replace(tmp, os.path.join(folder, name))
         with open(os.path.join(folder, "version.json.tmp"), "w", encoding="utf-8") as fh:
             json.dump({"versionCode": code, "versionName": str(version_name)}, fh)
         os.replace(os.path.join(folder, "version.json.tmp"), os.path.join(folder, "version.json"))
@@ -984,24 +1062,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # handled by hand so the GitHub token is not sent on to the download host
 
 
-def check_github_release(hub, repo, token, opener=None, api="https://api.github.com"):
-    """Offer the newest GitHub release's HealthTracker.apk if it is newer than what we have.
-    Release tags look like v2.0.<build>; <build> is the Android versionCode."""
+def check_github_release(hub, repo, token, opener=None, api="https://api.github.com", channel=DEFAULT_CHANNEL):
+    """Offer the newest GitHub release's APK if it is newer than what we have.
+    Health Tracker tags look like v2.0.<build>, where <build> is the Android versionCode;
+    FossFitness tags are vA.B.C (see fossfitness_code)."""
+    channel = channel_of(channel)
+    asset_name = CHANNELS[channel][1]
     opener = opener or urllib.request.build_opener(_NoRedirect)
-    head = {"Authorization": "Bearer " + token, "User-Agent": "HealthHub", "X-GitHub-Api-Version": "2022-11-28"}
+    head = {"User-Agent": "HealthHub", "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        head["Authorization"] = "Bearer " + token
     req = urllib.request.Request("%s/repos/%s/releases/latest" % (api, repo), headers={**head, "Accept": "application/vnd.github+json"})
     with opener.open(req, timeout=30) as r:
         rel = json.load(r)
-    m = re.match(r"^v?((?:\d+\.)*?(\d+))$", str(rel.get("tag_name") or ""))
-    if not m:
+    tag = str(rel.get("tag_name") or "")
+    if channel == "fossfitness":
+        name, code = fossfitness_code(tag)
+    else:
+        m = re.match(r"^v?((?:\d+\.)*?(\d+))$", tag)
+        name, code = (m.group(1), int(m.group(2))) if m else (None, None)
+    if code is None:
         return "latest release tag %r is not a version" % rel.get("tag_name")
-    name, code = m.group(1), int(m.group(2))
-    _, current = hub.apk_info()
+    _, current = hub.apk_info(channel)
     if current["available"] and code <= current["versionCode"]:
         return "up to date (%s)" % current["versionName"]
-    asset = next((a for a in rel.get("assets") or [] if a.get("name") == "HealthTracker.apk"), None)
+    asset = next((a for a in rel.get("assets") or [] if a.get("name") == asset_name), None)
     if not asset:
-        return "release %s has no HealthTracker.apk" % name
+        return "release %s has no %s" % (name, asset_name)
     req = urllib.request.Request(asset["url"], headers={**head, "Accept": "application/octet-stream"})
     try:
         resp = opener.open(req, timeout=60)
@@ -1011,15 +1098,15 @@ def check_github_release(hub, repo, token, opener=None, api="https://api.github.
         resp = urllib.request.urlopen(urllib.request.Request(e.headers["Location"], headers={"User-Agent": "HealthHub"}), timeout=300)
     with resp:
         length = int(resp.headers.get("Content-Length") or asset.get("size") or 0)
-        hub._install_apk(resp, length, code, name)
+        hub._install_apk(resp, length, code, name, channel)
     return "now offering %s" % name
 
 
-def github_release_loop(hub, repo, token, every=900):
+def github_release_loop(hub, repo, token, every=900, channel=DEFAULT_CHANNEL):
     time.sleep(20)
     while True:
         try:
-            print("healthhub: github release check:", check_github_release(hub, repo, token), flush=True)
+            print("healthhub: %s release check:" % channel, check_github_release(hub, repo, token, channel=channel), flush=True)
         except Exception as e:  # keep going; GitHub or the network may be down for a while
             print("healthhub: github release check failed:", repr(e), file=sys.stderr, flush=True)
         time.sleep(every)
@@ -1173,7 +1260,8 @@ def make_handler(hub):
             return self.rfile.read(length) if length else b""
 
         def _send_apk(self, path, info):
-            name = "HealthTracker-%s.apk" % (re.sub(r"[^0-9A-Za-z.]", "", info["versionName"]) or "latest")
+            base = "FossFitness" if os.path.basename(path) == "FossFitness.apk" else "HealthTracker"
+            name = "%s-%s.apk" % (base, re.sub(r"[^0-9A-Za-z.]", "", info["versionName"]) or "latest")
             size = os.path.getsize(path)
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.android.package-archive")
@@ -1229,7 +1317,7 @@ def make_handler(hub):
                 if path == "/healthz":
                     return self._send(200, {"ok": True, "version": VERSION})
                 if path == "/api/app":
-                    return self._send(200, hub.apk_info()[1])
+                    return self._send(200, hub.apk_info(q.get("app", [""])[0])[1])
                 if path == "/api/me":
                     conn = hub.db()
                     try:
@@ -1274,9 +1362,17 @@ def make_handler(hub):
                     return self._send(200, hub.store_apk(self.headers.get("Authorization") or "", self.rfile, length,
                                                          q.get("versionCode", [""])[0], q.get("versionName", [""])[0]))
                 if path == "/api/app/link":
-                    self._raw_body()
-                    return self._send(200, hub.apk_link(tok))
+                    try:
+                        link_body = json.loads(self._raw_body() or b"{}")
+                    except ValueError:
+                        link_body = {}
+                    app = link_body.get("app") if isinstance(link_body, dict) else None
+                    return self._send(200, hub.apk_link(tok, app or q.get("app", [""])[0]))
                 body = self._body()
+                if path == "/api/handoff":
+                    return self._send(200, hub.handoff_start(tok))
+                if path == "/api/handoff/claim":
+                    return self._send(200, hub.handoff_claim(body))
                 if path == "/api/register":
                     return self._send(200, hub.register(body))
                 if path == "/api/login":
@@ -1346,6 +1442,10 @@ def main():
         threading.Thread(target=github_release_loop, daemon=True,
                          args=(httpd.hub, os.environ.get("HT_GITHUB_REPO") or "merlinlcb/HealthTracker",
                                os.environ["HT_GITHUB_TOKEN"])).start()
+    if os.environ.get("HT_FOSSFITNESS_REPO"):
+        threading.Thread(target=github_release_loop, daemon=True,
+                         args=(httpd.hub, os.environ["HT_FOSSFITNESS_REPO"], os.environ.get("HT_GITHUB_TOKEN", "")),
+                         kwargs={"channel": "fossfitness"}).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

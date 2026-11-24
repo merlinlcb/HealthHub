@@ -467,7 +467,7 @@ class HubTest(unittest.TestCase):
             self.assertEqual(r.read(), apk)
             self.assertIn("HealthTracker-2.0.14.apk", r.headers["Content-Disposition"])
         self.call("GET", "/dl/made-up", expect=404)
-        hub._links[link["url"][4:]] = time.time() - 1
+        hub._links[link["url"][4:]] = (time.time() - 1, "healthtracker")
         self.call("GET", link["url"], expect=404)
         # The /get page also takes an account instead of the invite code.
         status, _, body = self.post_form("/download", {"username": "Merlin", "password": "password1"})
@@ -522,6 +522,88 @@ class HubTest(unittest.TestCase):
         finally:
             gh.shutdown()
             gh.server_close()
+
+    def test_fossfitness_update_channel(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        apk = b"PK\x03\x04" + os.urandom(150000)
+        state = {"tag": "v2.2.0", "auth": "unset"}
+
+        class FakeGitHub(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                base = "http://127.0.0.1:%d" % self.server.server_address[1]
+                if self.path == "/repos/me/fossfitness/releases/latest":
+                    state["auth"] = self.headers.get("Authorization")
+                    body = json.dumps({"tag_name": state["tag"], "assets": [
+                        {"name": "FossFitness.apk", "url": base + "/asset/2", "size": len(apk)}]}).encode()
+                    self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == "/asset/2":
+                    self.send_response(200); self.send_header("Content-Length", str(len(apk))); self.end_headers()
+                    self.wfile.write(apk)
+
+        gh = HTTPServer(("127.0.0.1", 0), FakeGitHub)
+        threading.Thread(target=gh.serve_forever, daemon=True).start()
+        api = "http://127.0.0.1:%d" % gh.server_address[1]
+        hub = self.httpd.hub
+        try:
+            self.assertEqual(self.call("GET", "/api/app?app=fossfitness")["available"], False)
+            msg = healthhub.check_github_release(hub, "me/fossfitness", "", api=api, channel="fossfitness")
+            self.assertEqual(msg, "now offering 2.2.0")
+            self.assertIsNone(state["auth"])  # public repo: no token needed or sent
+            self.assertEqual(self.call("GET", "/api/app?app=fossfitness"), {"available": True, "versionCode": 2200, "versionName": "2.2.0"})
+            # Old Health Tracker builds ask without ?app= and must not be offered FossFitness.
+            self.assertEqual(self.call("GET", "/api/app")["available"], False)
+            tok, _ = self.signup("merlin")
+            link = self.call("POST", "/api/app/link", {"app": "fossfitness"}, tok)
+            self.assertEqual(link["versionCode"], 2200)
+            with urllib.request.urlopen(self.base + link["url"]) as r:
+                self.assertEqual(r.read(), apk)
+                self.assertIn("FossFitness-2.2.0.apk", r.headers["Content-Disposition"])
+            self.call("POST", "/api/app/link", {}, tok, expect=404)  # nothing on the old channel yet
+            self.assertEqual(healthhub.check_github_release(hub, "me/fossfitness", "", api=api, channel="fossfitness"), "up to date (2.2.0)")
+            state["tag"] = "v2.2"
+            self.assertIn("not a version", healthhub.check_github_release(hub, "me/fossfitness", "", api=api, channel="fossfitness"))
+        finally:
+            gh.shutdown()
+            gh.server_close()
+
+    def test_fossfitness_version_codes(self):
+        self.assertEqual(healthhub.fossfitness_code("v2.1.0"), ("2.1.0", 2100))
+        self.assertEqual(healthhub.fossfitness_code("v2.10.0"), (None, None))
+        self.assertEqual(healthhub.fossfitness_code("2.0.123"), (None, None))
+        self.assertEqual(healthhub.fossfitness_code("v3.0.12"), ("3.0.12", 3012))
+
+    def test_handoff_moves_a_sign_in_once(self):
+        tok, _ = self.signup("merlin")
+        self.call("POST", "/api/handoff", {}, expect=401)
+        code = self.call("POST", "/api/handoff", {}, tok)["code"]
+        got = self.call("POST", "/api/handoff/claim", {"code": code, "device": "android"})
+        self.assertEqual(got["user"]["username"], "merlin")
+        self.assertNotEqual(got["token"], tok)
+        self.assertEqual(self.call("GET", "/api/me", token=got["token"])["user"]["username"], "merlin")
+        self.call("POST", "/api/handoff/claim", {"code": code}, expect=404)  # one use only
+        self.call("POST", "/api/handoff/claim", {"code": "guess"}, expect=404)
+        # Signing the old app out afterwards keeps the new one signed in.
+        self.call("POST", "/api/logout", {}, tok)
+        self.call("GET", "/api/me", token=got["token"])
+        # Expired codes don't work.
+        code = self.call("POST", "/api/handoff", {}, got["token"])["code"]
+        hub = self.httpd.hub
+        hub._handoffs[code] = (time.time() - 1, hub._handoffs[code][1])
+        self.call("POST", "/api/handoff/claim", {"code": code}, expect=404)
+
+    def test_sync_records_which_app_a_device_runs(self):
+        tok, _ = self.signup("merlin")
+        self.call("POST", "/api/sync", {"push": [], "since": 0, "client": {"app": "io.github.merlinlcb.fossfitness", "version": 2200}}, tok)
+        conn = self.httpd.hub.db()
+        try:
+            rows = [tuple(r) for r in conn.execute("SELECT app, app_version FROM tokens")]
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("io.github.merlinlcb.fossfitness", 2200)])
 
     def test_shared_notes(self):
         tok, _ = self.signup("merlin")
