@@ -1,4 +1,4 @@
-"""Tests for the HealthHub server. Run: python3 -m unittest server/test_healthhub.py"""
+"""Tests for the HealthHub server. Run: python3 -W ignore -m unittest -v test_healthhub.py"""
 import json
 import os
 import sys
