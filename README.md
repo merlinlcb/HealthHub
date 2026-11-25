@@ -26,6 +26,8 @@ friends or family, a weekly XP race, shared foods, and backing up your history s
 
 ## Quick start
 
+You need Python 3.10 or newer. Nothing else to install.
+
 ```bash
 HT_INVITE_CODE=letmein HT_DATA=./data python3 healthhub.py
 # open http://127.0.0.1:8787 (health check: /healthz)
