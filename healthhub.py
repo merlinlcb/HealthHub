@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""HealthHub - the shared server behind the Health Tracker app.
+"""HealthHub - the self-hosted server behind the FossFitness app (formerly Health Tracker).
+
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 Python standard library only (no pip installs). One SQLite file holds
 accounts, synced entries, chat and each person's game summary. It also

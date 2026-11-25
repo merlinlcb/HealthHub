@@ -1,5 +1,8 @@
 name: test
 on: [push, pull_request]
+# Tests only need to read the code.
+permissions:
+  contents: read
 jobs:
   unittest:
     runs-on: ubuntu-latest
